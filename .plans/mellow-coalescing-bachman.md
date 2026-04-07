@@ -1,567 +1,357 @@
-# replsh — Unified CLI Client for REPL Servers
+# `replsh launch` — Process Lifecycle, Toolchains, Config + `--init`
 
 ## Context
 
-LLMs need to run and test code in interactive REPL environments — evaluating expressions, checking outputs, iterating. But each REPL server (nREPL, Jupyter, Node.js) uses a different wire protocol, session model, and transport. replsh provides a single CLI with structured JSON output that LLMs can reliably parse. Sessions must be environment-aware (classpath, venv, node_modules) since LLMs need to test code against real project dependencies. Supporting three radically different backends (bencode, REST+WS, raw text) from the start ensures the abstraction is honest.
+replsh currently only connects to *existing* REPL servers. For Poetry/venv workflows, this means the user must manually start servers inside the right environment. The `launch` command automates this: spawn a server process → wait for readiness → connect.
 
-Built in Babashka. All three backends work in pure Babashka — no JVM fallback.
+Two independent dimensions:
+- **Protocol** (how to talk): nREPL, Jupyter, Node — the `:backend`
+- **Toolchain** (how to start): lein, deps.edn, bb, poetry, pipenv — the `:cmd`
 
-**Key design principle**: To the user (LLM), there is only one concept: a **named session**. Connections, sockets, kernels, and wire protocols are internal details. `replsh eval --name backend '(+ 1 2)'` — that's it.
+Also adds `--init` for post-connect bootstrap code (useful for both `launch` and `start`).
 
 ---
 
-## 1. Data Structure Shapes
+## Data Structure Shapes
 
-### Session Config (persisted to `~/.replsh/state.edn`)
+Four distinct shapes at different layers:
 
-The **session** is the only user-facing entity. Four concerns, cleanly separated:
-- **Identity + dispatch**: `:backend`, `:name`, `:created-at`
-- **Transport**: standardized `:transport` map — "where to connect" (internal detail)
-- **Environment**: universal `:env` map — "what context does this session have"
-- **Backend-specific**: `:backend-opts` — anything only one backend needs
+### 1. Toolchain Preset — global, reusable across projects
 
-`:name` is the **primary key** — user-provided, used in all commands.
+Defines backend protocol + cmd template with `{placeholder}` substitution.
 
 ```clojure
-;; nREPL session
-{:name        "backend"
- :backend     :nrepl
- :created-at  "2026-04-07T10:00:00Z"
- :transport   {:type :tcp :host "localhost" :port 1667}
- :env         {:cwd "/repo/backend"
-               :vars {"JAVA_HOME" "/usr/lib/jvm/java-21"}}
+;; ~/.replsh/config.edn
+{:toolchains
+ {"clojure.deps"   {:backend  :nrepl
+                    :cmd      "clj -M:nrepl -m nrepl.cmdline --port {port}"
+                    :defaults {:port 7888}}
+
+  "clojure.lein"   {:backend  :nrepl
+                    :cmd      "lein repl :headless :port {port}"
+                    :defaults {:port 7888}}
+
+  "clojure.bb"     {:backend  :nrepl
+                    :cmd      "bb --nrepl-server {port}"
+                    :defaults {:port 1667}}
+
+  "python.poetry"  {:backend  :jupyter
+                    :cmd      "poetry run jupyter server --port {port}"
+                    :defaults {:port 8888 :kernel "python3"}}
+
+  "python.venv"    {:backend  :jupyter
+                    :cmd      "{cwd}/.venv/bin/jupyter server --port {port}"
+                    :defaults {:port 8888 :kernel "python3"}}
+
+  "node"           {:backend  :node
+                    :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port})\""
+                    :defaults {:port 5001 :prompt-re "> "}}}}
+```
+
+Common toolchains ship built-in with replsh. Users extend/override in `~/.replsh/config.edn`.
+
+### 2. Session Spec — project-level, references toolchain
+
+Flat keys. References a toolchain by name. Any field overrides the toolchain.
+
+```clojure
+;; <project>/.replsh/config.edn
+{:sessions
+ {"backend"  {:toolchain "clojure.deps"
+              :port      1667
+              :init      "(require '[my.app])"}
+
+  "ml"       {:toolchain "python.poetry"
+              :port      8888
+              :cwd       "ml/"
+              :kernel    "python3"}
+
+  "frontend" {:toolchain "node"
+              :port      5001
+              :cwd       "frontend/"}
+
+  ;; Override toolchain cmd for a specific session
+  "legacy"   {:toolchain "clojure.lein"
+              :port      4567
+              :cmd       "lein with-profile +dev repl :headless :port {port}"}}}
+```
+
+### 3. Resolved Spec — in-memory only (toolchain + session + CLI merged)
+
+Flat, absolute paths, all values resolved, template vars substituted. Input to `launch-cmd`/`start-cmd`.
+
+```clojure
+{:backend-type :nrepl
+ :name         "backend"
+ :host         "localhost"
+ :port         1667
+ :cmd          "clj -M:nrepl -m nrepl.cmdline --port 1667"  ;; {port} substituted
+ :cwd          "/repo"
+ :init         "(require '[my.app])"
+ :env          {}
+ :kernel       nil :token nil :prompt-re nil}
+```
+
+### 4. Session Config — machine-generated, persisted to `~/.replsh/state.edn`
+
+Structured internal representation. What backends consume. Self-contained.
+
+```clojure
+{:name         "backend"
+ :backend      :nrepl
+ :created-at   "2026-04-07T10:00:00Z"
+ :transport    {:type :tcp :host "localhost" :port 1667}
+ :env          {:cwd "/repo" :vars {}}
+ :launch       {:cmd "clj -M:nrepl -m nrepl.cmdline --port 1667"
+                :cwd "/repo" :pid 12345}
+ :init-code    "(require '[my.app])"
  :backend-opts {}
- :internal    {:session-id "nrepl-sess-uuid"}}   ;; backend's own session ID
-
-;; Jupyter session
-{:name        "ml"
- :backend     :jupyter
- :created-at  "2026-04-07T10:00:00Z"
- :transport   {:type :http :url "http://localhost:8888" :token "abc123"}
- :env         {:cwd "/repo/ml"
-               :vars {"VIRTUAL_ENV" "/repo/ml/.venv"}}
- :backend-opts {:kernel-name "python3"}
- :internal    {:kernel-id "k-xyz"}}
-
-;; Node session
-{:name        "frontend"
- :backend     :node
- :created-at  "2026-04-07T10:00:00Z"
- :transport   {:type :tcp :host "localhost" :port 5001}
- :env         {:cwd "/repo/frontend" :vars {}}
- :backend-opts {:prompt-re "^> "}
- :internal    {}}
-
-;; Node via Unix socket
-{:name        "admin-repl"
- :backend     :node
- :created-at  "2026-04-07T10:00:00Z"
- :transport   {:type :unix :path "/tmp/node.sock"}
- :env         {:cwd "/repo/frontend" :vars {}}
- :backend-opts {:prompt-re "^> "}
- :internal    {}}
-```
-
-### Transport types (exhaustive)
-
-```clojure
-{:type :tcp  :host "localhost" :port 1667}    ;; nREPL, Node
-{:type :unix :path "/tmp/node.sock"}          ;; Node (alternative)
-{:type :http :url "http://localhost:8888"      ;; Jupyter (REST + WS upgrade)
-             :token "abc123"}
-```
-
-### Live Session State (in-memory only — never persisted)
-
-Opened from a Session Config when a command runs. Backend manages connection internals.
-
-```clojure
-{:config     {... session config ...}
- :backend    :nrepl                       ;; hoisted for dispatch
- :status     :connected | :error
- :handles    {;; backend-specific I/O handles
-              ;; nrepl:   {:socket Socket :in PushbackInputStream :out OutputStream}
-              ;; jupyter: {:http-client HttpClient :ws WebSocket}
-              ;; node:    {:socket Socket :in BufferedReader :out PrintWriter}
-              }
- :pending    {}    ;; {msg-id -> {:promise p :chunks-atom a}}
- :reader-thread nil}
-```
-
-Internally, backends may **share connections** across sessions (e.g., two nREPL sessions on the same server reuse one TCP socket). This is an optimization the backend manages transparently — a connection pool keyed by transport config. The user never sees it.
-
-### Eval Request (internal, built by orchestration layer)
-
-```clojure
-{:code        "(+ 1 2)"
- :name        "backend"          ;; session name
- :backend     :nrepl
- :timeout-ms  30000
- :msg-id      "eval-7f3a"}
-```
-
-### Response Chunk (streaming output unit)
-
-```clojure
-{:type       :out | :err | :value | :error | :status
- :content    "6"
- :stream     :stdout | :stderr | nil    ;; only for :out/:err
- :meta       {:ns "user"}               ;; backend-specific
- :done?      false
- :msg-id     "eval-7f3a"
- :name       "backend"}
-```
-
-### Error Shape (consistent across all operations)
-
-```clojure
-{:error    true
- :code     :connection-refused | :timeout | :session-not-found
-           | :eval-error | :unsupported | :parse-error | :unknown
- :message  "Connection refused to localhost:1667"
- :backend  :nrepl
- :detail   {}}
-```
-
-### Command (parsed CLI input)
-
-```clojure
-{:command   [:start :nrepl]
- :args      {:address "localhost:1667" :name "backend" :cwd "/repo/backend"}
- :opts      {:timeout 30000}
- :raw-args  ["start" "nrepl" "localhost:1667" "--name" "backend" "--cwd" "/repo/backend"]}
+ :internal     {:session-id "nrepl-sess-uuid"}}
 ```
 
 ---
 
-## 2. Logic Layers & Data Flow
+## Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 1: CLI Parsing  (replsh.cli)                         │
-│  IN:  raw *command-line-args*                               │
-│  OUT: Command map                                           │
-│  Side effects: none                                         │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 2: Orchestration  (replsh.command)                   │
-│  IN:  Command map                                           │
-│  OUT: Result map (success or error envelope)                │
-│  Side effects: reads/writes ~/.replsh/state.edn,            │
-│                calls backend layer, manages reconnection    │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 3: Backend Dispatch  (replsh.backend + backend/*)    │
-│  IN:  session config + request maps                         │
-│  OUT: response chunks, live session state, errors           │
-│  Side effects: delegates to transport layer                 │
-├─────────────────────────────────────────────────────────────┤
-│  Layer 4: Transport  (replsh.transport.*)                   │
-│  IN:  backend-specific wire data                            │
-│  OUT: backend-specific raw responses                        │
-│  Side effects: all actual I/O (sockets, HTTP, WebSocket)    │
-└─────────────────────────────────────────────────────────────┘
+Built-in toolchain presets (hardcoded in replsh)
+         │
+         ▼  extended/overridden by
+~/.replsh/config.edn :toolchains (Toolchain Preset)
+         │
+         ▼  referenced by :toolchain key
+<project>/.replsh/config.edn :sessions (Session Spec)
+         │
+         ▼  overridden by
+CLI args (--port, --cmd, --init, etc.)
+         │
+         ▼
+┌─────────────────────────────────────────────────┐
+│  config/resolve-session  (Config layer)         │
+│  1. Lookup toolchain → get {:backend :cmd ...}  │
+│  2. Merge toolchain defaults                    │
+│  3. Merge session spec (overrides toolchain)    │
+│  4. Merge CLI args (overrides everything)       │
+│  5. Resolve relative :cwd to absolute           │
+│  6. Substitute {port}, {cwd} in :cmd template   │
+│  OUT: Resolved Spec                             │
+└──────────────────┬──────────────────────────────┘
+                   ▼
+┌─────────────────────────────────────────────────┐
+│  command/launch-cmd  (Orchestration)            │
+│  1. process/spawn! with resolved :cmd → PID     │
+│  2. process/wait-for-port!                      │
+│  3. Transform Resolved Spec → Session Config    │
+│     :host+:port → {:transport {:type :tcp ..}}  │
+│     :cwd+:env   → {:env {:cwd .. :vars ..}}    │
+│     :cmd+PID    → {:launch {:cmd .. :pid ..}}   │
+│     :init       → {:init-code "..."}            │
+│  4. backend/open! → :internal                   │
+│  5. run-init! (if init-code)                    │
+│  6. Persist Session Config to state.edn         │
+└──────────────────┬──────────────────────────────┘
+                   ▼
+┌─────────────────────────────────────────────────┐
+│  state.edn (Session Config)                     │
+│  Self-contained — eval/stop/restart/status      │
+│  never read config files                        │
+└─────────────────────────────────────────────────┘
 ```
 
-### Layer 1 → 2: CLI Parsing
+**Key**: Config files are consulted only during `launch`/`start`. Once persisted, `state.edn` is the source of truth.
 
-`babashka.cli/dispatch` with a command table. Pure parsing, no I/O.
-
-```clojure
-[{:cmds ["start" "nrepl"]    :fn cmd/start    :args->opts [:address]}
- {:cmds ["start" "jupyter"]  :fn cmd/start    :args->opts [:url]}
- {:cmds ["start" "node"]     :fn cmd/start    :args->opts [:address]}
- {:cmds ["eval"]             :fn cmd/eval     :args->opts [:code]}
- {:cmds ["ls"]               :fn cmd/ls}
- {:cmds ["stop"]             :fn cmd/stop     :args->opts [:name]}
- {:cmds ["restart"]          :fn cmd/restart  :args->opts [:name]}
- {:cmds ["interrupt"]        :fn cmd/interrupt}
- {:cmds ["status"]           :fn cmd/status}]
-```
-
-All commands that target a session accept `--name <session-name>`. When omitted, uses the active session.
-
-### Layer 2: Orchestration
-
-Coordinates state, builds requests, wraps results in output envelopes.
-
-Key responsibility: the CLI layer gives us raw args like `{:address "localhost:1667" :name "backend"}`. The orchestration layer assembles these into the structured Session Config before passing to backends.
-
-```clojure
-(defn eval-cmd [{:keys [args opts]}]
-  (let [state        (state/load)
-        session-name (or (:name args) (:active state))
-        session-cfg  (get-in state [:sessions session-name])
-        ;; open connection from persisted config (stateless CLI model)
-        live-state   (backend/open! session-cfg)
-        request      {:code       (:code args)
-                      :name       session-name
-                      :backend    (:backend session-cfg)
-                      :timeout-ms (or (:timeout opts) 30000)
-                      :msg-id     (util/gen-id "eval")}
-        result       (backend/eval! request live-state)]
-    (backend/close! live-state)
-    result))
-```
-
-### Layer 3 → 4: Backend translates between generic maps and wire format
-
-nREPL example:
-```
-Eval Request map                     bencode wire bytes
-{:code "(+ 1 2)"        ───────►    {"op" "eval" "code" "(+ 1 2)"
- :name "backend"                     "session" "nrepl-sess-uuid"
- :msg-id "eval-9f2b"}                "id" "eval-9f2b"}
-
-bencode response bytes               Response Chunk map
-{"id" "eval-9f2b"        ◄───────   {:type :value :content "3"
- "value" "3" "ns" "user"              :meta {:ns "user"}
- "status" ["done"]}                    :done? true}
-```
-
-Note: the backend translates `:name` → the internal nREPL session ID from `:internal` in the Session Config.
+**Backends don't change at all** — they connect to a running server. Process management + config resolution are separate layers above.
 
 ---
 
-## 3. Data Flow Traces
+## Config Files
 
-### `replsh eval --name backend '(+ 1 2)'`
+### `~/.replsh/config.edn` (global)
 
-```
-["eval" "--name" "backend" "(+ 1 2)"]
-        │
-        ▼  [Layer 1: parse]
-{:command [:eval] :args {:name "backend" :code "(+ 1 2)"}}
-        │
-        ▼  [Layer 2: orchestrate]
-        ├─ state/load → get session config for "backend"
-        ├─ backend/open! (open socket from persisted transport config)
-        ├─ build eval request map
-        │
-        ▼  [Layer 3: defmethod eval! :nrepl]
-        ├─ get nREPL session-id from config :internal
-        ├─ translate to bencode msg, send via transport
-        ├─ wait for response chunks matched by msg-id
-        │
-        ▼  [Layer 4: transport]
-        ├─ tcp/send-bencode, tcp/read-bencode
-        │
-        ▼  [Layer 3: normalize response]
-[{:type :value :content "3" :meta {:ns "user"} :done? true}]
-        │
-        ▼  [Layer 2: wrap in envelope]
-{"ok": true, "command": "eval",
- "data": {"name": "backend",
-          "chunks": [{"type": "value", "content": "3", "meta": {"ns": "user"}}],
-          "value": "3", "ns": "user"}}
-```
+Toolchain presets. User-defined/overridden. Searched at fixed path (override with `REPLSH_CONFIG_GLOBAL`).
 
-### `replsh start jupyter http://localhost:8888 --name ml --kernel python3 --cwd /repo/ml --env VIRTUAL_ENV=...`
+### `<project>/.replsh/config.edn` (project)
+
+Session definitions. Searched from cwd walking up to filesystem root (like `.gitignore`). Override with `REPLSH_CONFIG` env var.
+
+### Resolution order
 
 ```
-["start" "jupyter" "http://localhost:8888" "--name" "ml" "--kernel" "python3"
- "--cwd" "/repo/ml" "--env" "VIRTUAL_ENV=..."]
-        │
-        ▼  [Layer 1: parse]
-{:command [:start :jupyter]
- :args {:url "http://localhost:8888" :name "ml" :kernel "python3"
-        :cwd "/repo/ml" :env {"VIRTUAL_ENV" "..."}}}
-        │
-        ▼  [Layer 2: orchestrate]
-        ├─ build session config:
-        │  {:name "ml" :backend :jupyter
-        │   :transport {:type :http :url "http://..." :token nil}
-        │   :env {:cwd "/repo/ml" :vars {"VIRTUAL_ENV" "..."}}
-        │   :backend-opts {:kernel-name "python3"}}
-        ├─ call backend/open! with config
-        │
-        ▼  [Layer 3: defmethod open! :jupyter]
-        ├─ POST /api/kernels {"name": "python3", "env": {"VIRTUAL_ENV": "..."}}
-        ├─ open WebSocket to /api/kernels/{kernel-id}/channels
-        ├─ return live-state + update config :internal {:kernel-id "k-abc"}
-        │
-        ▼  [Layer 2: persist session config to state.edn, close, wrap]
-{"ok": true, "command": "start",
- "data": {"name": "ml", "backend": "jupyter",
-          "kernel_name": "python3",
-          "env": {"cwd": "/repo/ml",
-                  "vars": {"VIRTUAL_ENV": "..."}}}}
+toolchain :defaults → toolchain top-level → session spec → CLI args
 ```
+
+Any field specified at a later stage overrides the earlier one. Flat merge, no nesting.
 
 ---
 
-## 4. Multimethod Design
-
-All dispatch on `:backend` keyword. Declarations in `replsh.backend`, implementations in `replsh.backend.*`:
-
-```clojure
-(ns replsh.backend)
-
-;; Session lifecycle
-(defmulti open!      (fn [session-config]    (:backend session-config)))  ;; → live-state
-(defmulti close!     (fn [live-state]        (:backend live-state)))      ;; → nil
-(defmulti destroy!   (fn [session-config]    (:backend session-config)))  ;; → nil (cleanup server-side resources)
-
-;; Evaluation
-(defmulti eval!      (fn [request live-state] (:backend request)))        ;; → [response-chunks]
-(defmulti interrupt! (fn [live-state]         (:backend live-state)))     ;; → :ok | error
-```
-
-**5 multimethods, not 7.** The flattened session model removed `session-create`, `session-list`, `session-close` — those are now `start`, `ls`, `stop` at the orchestration layer.
-
-- **`open!`**: Open transport handles for an existing session config. Called on each CLI invocation (stateless model).
-- **`close!`**: Close transport handles. Called after each CLI invocation.
-- **`destroy!`**: Clean up server-side resources (Jupyter: DELETE kernel, nREPL: send "close" op, Node: no-op). Called by `replsh stop`.
-- **`eval!`**: Send code, collect response chunks.
-- **`interrupt!`**: Cancel a running eval.
-
-Each backend file requires `replsh.backend` and provides `defmethod` for all five.
-
----
-
-## 5. Environment-Aware Sessions
-
-| Backend | cwd/env handling |
-|---------|-----------------|
-| **nREPL** | Metadata only — server already running with baked-in classpath. Stored so LLM can query via `replsh status`. |
-| **Jupyter** | Active — `POST /api/kernels` accepts `env` map. Kernel spawned with those env vars. `cwd` set via kernel `cwd` field or bootstrap `os.chdir()` eval. |
-| **Node** | Metadata only — server already running. `require()` resolves from wherever the server was started. |
-
-LLM workflow — polyglot project:
-```bash
-# 1. LLM starts servers from the right dirs
-cd /repo/backend && bb --nrepl-server 1667
-cd /repo/frontend && node -e "require('net').createServer(s=>require('repl').start({input:s,output:s})).listen(5001)"
-jupyter server &
-
-# 2. LLM creates named sessions
-replsh start nrepl localhost:1667 --name backend --cwd /repo/backend
-replsh start node localhost:5001 --name frontend --cwd /repo/frontend
-replsh start jupyter http://localhost:8888 --name ml --kernel python3 --cwd /repo/ml --env VIRTUAL_ENV=/repo/ml/.venv
-
-# 3. LLM evals against any session by name
-replsh eval --name backend '(my-api/handler {:method :get :path "/users"})'
-replsh eval --name frontend 'require("./src/api").fetchUsers()'
-replsh eval --name ml 'model.predict(test_data)'
-
-# 4. LLM lists all sessions
-replsh ls
-# → [{"name": "backend", "backend": "nrepl", "env": {"cwd": "/repo/backend"}},
-#    {"name": "frontend", "backend": "node", "env": {"cwd": "/repo/frontend"}},
-#    {"name": "ml", "backend": "jupyter", "env": {"cwd": "/repo/ml"}}]
-
-# 5. Lifecycle
-replsh stop frontend
-replsh restart ml
-```
-
----
-
-## 6. Output Contract for LLMs
-
-Every command emits exactly one JSON object on stdout. No decoration, no extra text.
-
-### Envelope
-
-```json
-{"ok": true, "command": "eval", "data": { ... }}
-{"ok": false, "command": "eval", "error": {"code": "timeout", "message": "...", "detail": {}}}
-```
-
-### Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Eval error (code threw) |
-| 2 | Client error (bad args, connection refused, session not found) |
-| 3 | Timeout |
-
-### Command-specific `data` shapes
-
-**start:**
-```json
-{"ok": true, "command": "start",
- "data": {"name": "backend", "backend": "nrepl",
-          "env": {"cwd": "/repo/backend", "vars": {}}}}
-```
-
-**eval:**
-```json
-{"ok": true, "command": "eval",
- "data": {"name": "backend",
-          "chunks": [
-            {"type": "out", "content": "hello\n", "stream": "stdout"},
-            {"type": "value", "content": "42", "meta": {"ns": "user"}}
-          ],
-          "value": "42",
-          "ns": "user"}}
-```
-
-`value` and `ns` are hoisted from chunks for quick LLM access. Eval errors include both `error` and `data.chunks` so the LLM sees partial output before the failure.
-
-**ls:**
-```json
-{"ok": true, "command": "ls",
- "data": {"sessions": [
-   {"name": "backend", "backend": "nrepl", "env": {"cwd": "/repo/backend"}},
-   {"name": "ml", "backend": "jupyter", "env": {"cwd": "/repo/ml"}},
-   {"name": "frontend", "backend": "node", "env": {"cwd": "/repo/frontend"}}
- ], "active": "backend"}}
-```
-
-**status:**
-```json
-{"ok": true, "command": "status",
- "data": {"name": "backend", "backend": "nrepl",
-          "transport": {"type": "tcp", "host": "localhost", "port": 1667},
-          "env": {"cwd": "/repo/backend", "vars": {}},
-          "reachable": true}}
-```
-
-**stop / restart / interrupt:**
-```json
-{"ok": true, "command": "stop", "data": {"name": "backend"}}
-```
-
----
-
-## 7. Stateless CLI Model
-
-Each invocation: load state → open transport → operate → close transport → update state. No daemon, no background process. Ideal for LLM consumers.
-
-nREPL sessions persist server-side across replsh invocations — we just reopen a TCP connection and specify the stored session ID from `:internal`.
-
-### State location
-
-**Global**: `~/.replsh/state.edn`. Sessions span projects — an LLM working on a polyglot codebase needs `backend`, `ml`, and `frontend` from anywhere.
-
-Override with `REPLSH_STATE` env var.
-
-### `~/.replsh/state.edn`
-
-Keyed by session **name**:
-
-```clojure
-{:active "backend"
- :sessions
- {"backend"
-  {:name        "backend"
-   :backend     :nrepl
-   :created-at  "2026-04-07T10:00:00Z"
-   :transport   {:type :tcp :host "localhost" :port 1667}
-   :env         {:cwd "/repo/backend" :vars {}}
-   :backend-opts {}
-   :internal    {:session-id "nrepl-sess-uuid"}}
-
-  "ml"
-  {:name        "ml"
-   :backend     :jupyter
-   :created-at  "2026-04-07T10:00:00Z"
-   :transport   {:type :http :url "http://localhost:8888" :token "abc"}
-   :env         {:cwd "/repo/ml" :vars {"VIRTUAL_ENV" "/repo/ml/.venv"}}
-   :backend-opts {:kernel-name "python3"}
-   :internal    {:kernel-id "k-abc"}}
-
-  "frontend"
-  {:name        "frontend"
-   :backend     :node
-   :created-at  "2026-04-07T10:00:00Z"
-   :transport   {:type :tcp :host "localhost" :port 5001}
-   :env         {:cwd "/repo/frontend" :vars {}}
-   :backend-opts {:prompt-re "^> "}
-   :internal    {}}}}
-```
-
----
-
-## 8. File Structure
-
-```
-replsh/
-  bb.edn
-  src/replsh/
-    main.clj               ;; entry: parse → orchestrate → emit
-    cli.clj                 ;; babashka.cli dispatch table → Command map
-    command.clj             ;; orchestration: each command as fn
-    backend.clj             ;; defmulti declarations (open!, close!, destroy!, eval!, interrupt!)
-    backend/
-      nrepl.clj             ;; defmethod * :nrepl
-      jupyter.clj           ;; defmethod * :jupyter
-      node.clj              ;; defmethod * :node
-    transport/
-      tcp.clj               ;; socket, bencode read/write, text read/write
-      http.clj              ;; babashka.http-client wrapper
-      ws.clj                ;; babashka.http-client.websocket wrapper
-    state.clj               ;; ~/.replsh/state.edn load/save
-    output.clj              ;; JSON envelope construction + emit
-    util.clj                ;; gen-id, timestamp, parse-address, parse-env-arg
-```
-
----
-
-## 9. Implementation Order
-
-### Phase 1: Skeleton + nREPL
-1. `bb.edn`, directory structure, `main.clj` entry point
-2. `cli.clj` — dispatch table, arg parsing
-3. `output.clj` — JSON envelope construction
-4. `state.clj` — load/save `~/.replsh/state.edn`
-5. `backend.clj` — all 5 defmulti declarations
-6. `transport/tcp.clj` — socket open/close, bencode read/write
-7. `backend/nrepl.clj` — all defmethods for :nrepl
-   - `open!`: TCP socket + bencode + clone op → get nREPL session-id, store in :internal
-   - `eval!`: send eval op, background reader dispatches by msg-id to pending promises
-   - `destroy!`: send close op for the nREPL session
-8. `command.clj` — start, eval, ls, stop, restart, status, interrupt
-9. Test against `bb --nrepl-server 1667`
-
-### Phase 2: Node.js Backend
-1. `backend/node.clj` — extend tcp.clj with text read/write
-2. Prompt detection (configurable regex via `:backend-opts`, timeout fallback)
-3. `open!` = open TCP socket, `destroy!` = close socket (no server-side session)
-4. Validate abstraction still holds
-
-### Phase 3: Jupyter Backend
-1. `transport/http.clj`, `transport/ws.clj`
-2. `backend/jupyter.clj` — REST lifecycle + WebSocket eval
-3. `open!`: POST /api/kernels + open WS. Store kernel-id in :internal
-4. `eval!`: execute_request on WS, match responses by parent_header.msg_id
-5. `destroy!`: close WS + DELETE /api/kernels/{kernel-id}
-6. Environment passthrough on kernel creation
-7. Token auth via `--token` / `JUPYTER_TOKEN`
-
-### Phase 4: Polish
-1. `--timeout` for eval
-2. Reconnection robustness (detect stale sessions)
-3. Error messages and `--help`
-
----
-
-## 10. Verification
+## CLI
 
 ```bash
-# nREPL
-bb --nrepl-server 1667 &
-replsh start nrepl localhost:1667 --name backend --cwd .
-replsh eval --name backend '(+ 1 2)'        # → {"ok":true,"data":{"value":"3"}}
-replsh eval --name backend '(println "hi")'  # → chunks with :out and :value
-replsh interrupt --name backend              # → :ok
-replsh stop backend
+# Launch from project config (reads toolchain + session)
+replsh launch --name backend
 
-# Node
-node -e "require('net').createServer(s=>require('repl').start({input:s,output:s})).listen(5001)" &
-replsh start node localhost:5001 --name frontend --cwd .
-replsh eval --name frontend '1+1'            # → {"ok":true,"data":{"value":"2"}}
-replsh stop frontend
+# Launch with full CLI args (no config needed, backend as subcommand)
+replsh launch nrepl --name backend --port 1667 \
+  --cmd "bb --nrepl-server 1667" --cwd /repo
 
-# Jupyter
-jupyter server &
-replsh start jupyter http://localhost:8888 --token TOKEN --name ml --kernel python3 --cwd . --env VIRTUAL_ENV=/proj/.venv
-replsh eval --name ml 'print(42)'            # → chunks with :out "42\n"
-replsh interrupt --name ml
-replsh restart ml
-replsh stop ml
+# Launch from config + CLI override
+replsh launch --name backend --cmd "clj -M:dev:nrepl -m nrepl.cmdline --port {port}"
 
-# Multi-session management
-replsh ls                                     # → all sessions
-replsh status --name backend                  # → detailed info + reachability
+# Start (connect-only, no process spawn)
+replsh start --name backend       # from config
+replsh start nrepl --name backend --port 1667  # from CLI
+
+# --init on both launch and start
+replsh launch --name backend --init "(require '[my.app :as app])"
+replsh start --name backend --init "(require '[my.app :as app])"
+```
+
+When using config: backend type comes from toolchain `:backend`. When using CLI only: backend type is the subcommand.
+
+---
+
+## File Changes
+
+### 1. NEW: `src/replsh/process.clj`
+
+Process lifecycle. No knowledge of backends or config.
+
+- **`spawn!`** `[{:keys [cmd cwd env-vars name]}] -> {:pid long :process Process}`
+  - `ProcessBuilder ["/bin/sh" "-c" cmd]`, set `.directory()`, merge env via `.environment()`
+  - Redirect stdout+stderr to `~/.replsh/logs/<name>.log`
+  - Check alive after 200ms — throws `:launch-failed` if dead
+
+- **`wait-for-port!`** `[{:keys [host port timeout-ms process]}] -> true | throws`
+  - Poll TCP connect every 250ms. Check `process.isAlive()` each iteration.
+  - Throws `:port-timeout` or `:launch-failed`
+
+- **`wait-for-http!`** `[{:keys [url timeout-ms process]}] -> true | throws`
+  - Same pattern, polls HTTP GET to `<url>/api/status`. For Jupyter.
+
+- **`kill!`** `[pid] -> :killed | :already-dead`
+  - `ProcessHandle/of` → `.destroy()` (SIGTERM) → wait 3s → `.destroyForcibly()` (SIGKILL)
+
+- **`alive?`** `[pid] -> boolean`
+
+### 2. NEW: `src/replsh/config.clj`
+
+Config loading + resolution. The bridge between user-authored config and internal data.
+
+- **`builtin-toolchains`** — hardcoded map of common toolchains (clojure.deps, clojure.lein, clojure.bb, python.poetry, python.venv, node)
+
+- **`load-global-config`** `[] -> map | nil`
+  - Read `~/.replsh/config.edn` (or `REPLSH_CONFIG_GLOBAL`)
+
+- **`load-project-config`** `[] -> {:config map :dir path} | nil`
+  - Walk from cwd upward looking for `.replsh/config.edn` (or `REPLSH_CONFIG`)
+  - Returns both the config and the directory it was found in (for resolving relative paths)
+
+- **`resolve-toolchains`** `[global-config] -> merged-toolchains`
+  - `(merge builtin-toolchains (:toolchains global-config))`
+
+- **`resolve-session`** `[toolchains project-config session-name cli-opts] -> Resolved Spec`
+  1. Lookup session in project config: `(get-in project-config [:config :sessions session-name])`
+  2. Lookup toolchain: `(get toolchains (:toolchain session-spec))`
+  3. Merge: `toolchain :defaults` → toolchain top-level → session spec → CLI opts
+  4. Resolve relative `:cwd` against project config dir
+  5. Substitute `{port}`, `{cwd}`, `{host}` in `:cmd` string
+  6. Derive `:address` or `:url` from `:host` + `:port` if not explicitly set
+
+- **`substitute-template`** `[cmd-template resolved-map] -> cmd-string`
+  - Replace `{port}`, `{cwd}`, `{host}` etc. in the cmd string
+
+### 3. MODIFY: `src/replsh/cli.clj`
+
+- Add `launch-handler` — loads config, resolves session, delegates to `cmd/launch-cmd`
+  - `replsh launch --name X`: resolve from config (no subcommand needed)
+  - `replsh launch nrepl --name X ...`: use subcommand as backend, config provides defaults
+- Add dispatch entries: `["launch" "nrepl"]`, `["launch" "jupyter"]`, `["launch" "node"]`, `["launch"]` (config-only)
+- Add `--init`, `--port` to existing `start` and new `launch` specs
+- Modify `start-handler` to also resolve from config when `--name` matches a config entry
+
+### 4. MODIFY: `src/replsh/command.clj`
+
+Add `(:require [replsh.process :as process] [clojure.string :as str])`.
+
+**New `launch-cmd`**:
+1. `process/spawn!` with cmd, cwd, env-vars
+2. `process/wait-for-port!` or `wait-for-http!` (based on backend type)
+3. Build Session Config from Resolved Spec + `:launch {:cmd .. :pid ..}`
+4. `backend/open!` to verify connectivity
+5. `run-init!` if init-code provided
+6. `backend/close!`, persist session
+7. On ANY failure post-spawn: `process/kill!` to prevent orphans, re-throw
+
+**New `run-init!`** helper (shared by `launch-cmd` and `start-cmd`):
+- Eval init code via `backend/eval!`, throws `:init-failed` on error
+
+**Modified `start-cmd`**: Accept `:init`, call `run-init!` after open. On init failure: close, destroy, throw.
+
+**Modified `stop-cmd`**: If session has `:launch`, `process/kill!` before `backend/destroy!`.
+
+**Modified `restart-cmd`**: If session has `:launch`, kill → re-spawn → wait → re-connect. Else existing behavior.
+
+**Modified `status-cmd`**: Show `{:launch {:pid N :alive bool :cmd "..."}}` when present.
+
+### 5. No changes needed
+
+- `src/replsh/backend.clj` and all backend implementations — unaware of process/config
+- `src/replsh/state.clj` — `:launch` and `:init-code` are just EDN fields
+- `src/replsh/main.clj` — error handling already generic
+- `bb.edn` — `ProcessBuilder`/`ProcessHandle` are JVM stdlib
+
+---
+
+## Error Handling
+
+| Failure | Behavior |
+|---------|----------|
+| Bad command / missing binary | `spawn!` detects death within 200ms, reads log, throws `:launch-failed` |
+| Process starts but never listens | `wait-for-port!` checks liveness each poll; fails fast if dead, else times out. Catch block kills orphan |
+| Port opens but `backend/open!` fails | Catch block kills spawned process |
+| Init code fails | Throws `:init-failed`, kills process, session NOT persisted |
+| Process dies later | `status-cmd` shows `{:alive false}`. `eval` fails with connection refused. User can `restart` or `stop` |
+| Toolchain not found | Throws at config resolution time with clear message |
+| No config file found | Fine for CLI-only usage. Error only if `--name` used without subcommand and no config |
+
+---
+
+## Verification
+
+```bash
+# 1. Launch from config
+# .replsh/config.edn: {:sessions {"backend" {:toolchain "clojure.bb" :port 1667}}}
+replsh launch --name backend
+replsh eval --name backend '(+ 1 2)'       # → {"ok":true,"data":{"value":"3"}}
+replsh status --name backend               # → {...,"launch":{"pid":...,"alive":true,...}}
+replsh stop backend                        # → kills process, removes session
+
+# 2. Launch with full CLI (no config)
+replsh launch nrepl --name dev --port 1668 \
+  --cmd "bb --nrepl-server 1668"
+replsh eval --name dev '(+ 1 2)'
+
+# 3. Launch with --init
+replsh launch --name backend \
+  --init "(require '[clojure.string :as str])"
+replsh eval --name backend '(str/upper-case "hello")'  # → "HELLO"
+
+# 4. Config override
+replsh launch --name backend --cmd "clj -M:dev:nrepl -m nrepl.cmdline --port {port}"
+
+# 5. Poetry/venv workflow
+# .replsh/config.edn: {:sessions {"ml" {:toolchain "python.poetry" :port 8888 :cwd "ml/"}}}
+replsh launch --name ml
+replsh eval --name ml 'import pandas; print(pandas.__version__)'
+
+# 6. Launch failure
+replsh launch nrepl --name bad --port 9999 --cmd "nonexistent-binary"
+# → {"ok":false,"error":{"code":"launch_failed",...}}
+
+# 7. Restart re-launches
+replsh restart --name backend
+# → kills old process, spawns new one, reconnects
+
+# 8. Start (connect-only, no spawn)
+replsh start --name backend --init "(in-ns 'my.ns)"
 ```
