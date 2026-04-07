@@ -2,6 +2,7 @@
   (:require [replsh.backend :as backend]
             [replsh.backend.nrepl]
             [replsh.backend.node]
+            [replsh.backend.jupyter]
             [replsh.state :as state]
             [replsh.output :as output]
             [replsh.util :as util]))
