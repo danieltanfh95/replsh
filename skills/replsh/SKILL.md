@@ -4,10 +4,10 @@ description: >
   A thinking medium for LLM agents. Use the REPL to verify assumptions, inspect
   runtime state, and test hypotheses — think before you write. Timeouts return
   partial output (never lose work). Streaming and background eval handle any
-  timescale. Supports Clojure (deps.edn, Leiningen, Babashka), Python (Poetry,
-  venv), and Node.js. Activate when working on any project with a
-  .replsh/config.edn, or any Clojure/Python/Node project where a REPL would
-  help you understand the code.
+  timescale. Supports Clojure (deps.edn, Leiningen, Babashka), Python (native
+  bridge — zero deps, or Jupyter for rich output), and Node.js. Activate when
+  working on any project with a .replsh/config.edn, or any Clojure/Python/Node
+  project where a REPL would help you understand the code.
 license: EPL-2.0
 compatibility: Requires Babashka (bb) installed. REPL servers started by replsh or running externally.
 metadata:
@@ -76,8 +76,13 @@ replsh eval --name dev '(clojure.test/run-tests (quote my.ns-test))'
 - **Test fixes** before committing them.
 
 ```bash
-# Python: inspect a DataFrame shape
-replsh eval --name ml 'import pandas as pd; df = pd.read_csv("data.csv"); print(df.dtypes); print(df.shape)'
+# Python: inspect a DataFrame shape (use --file for multiline)
+replsh eval --name ml --file /dev/stdin <<'EOF'
+import pandas as pd
+df = pd.read_csv('data.csv')
+print(df.dtypes)
+print(df.shape)
+EOF
 
 # Clojure: check what's in an atom/state
 replsh eval --name dev '(deref my-app-state)'
@@ -135,7 +140,13 @@ replsh launch nrepl --name dev --cmd "bb --nrepl-server {port}"
 # Clojure (deps.edn)
 replsh launch nrepl --name dev --cmd "clj -M:nrepl -m nrepl.cmdline --port {port}"
 
-# Python (Poetry)
+# Python (lightweight — no Jupyter required)
+replsh launch python --name py --cmd "python3 {bridge} --port {port}"
+
+# Python (Poetry environment)
+replsh launch python --name ml --cmd "poetry run python {bridge} --port {port}"
+
+# Python (Jupyter — for images/HTML/widgets)
 replsh launch jupyter --name ml --cmd "poetry run jupyter server --port {port}" --kernel python3
 
 # Node.js
@@ -217,7 +228,7 @@ replsh eval --name dev '(expensive-fn)' --timeout 5000 --hard-timeout 60000
 replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 ```
 
-`--hard-timeout` interrupts the eval server-side (nREPL interrupt, Jupyter interrupt). Returns exit code 3. Use when you need to guarantee the eval stops.
+`--hard-timeout` interrupts the eval server-side (nREPL interrupt, Jupyter interrupt, SIGINT for Python/Node). Returns exit code 3. Use when you need to guarantee the eval stops.
 
 ## Command Reference
 
@@ -249,7 +260,7 @@ replsh logs --name <n> --tail 20       # last 20 lines
 replsh logs --name <n> --follow        # tail until process exits
 ```
 
-Backends: `nrepl`, `jupyter`, `node`. Optional when using project config.
+Backends: `nrepl`, `python`, `jupyter`, `node`. Optional when using project config.
 
 ## Output Format
 
@@ -301,16 +312,41 @@ NDJSON — one JSON line per chunk, final line is the summary:
 | `clojure.deps` | nrepl | `clj -M:nrepl -m nrepl.cmdline --port {port}` |
 | `clojure.lein` | nrepl | `lein repl :headless :port {port}` |
 | `clojure.bb` | nrepl | `bb --nrepl-server {port}` |
-| `python.poetry` | jupyter | `poetry run jupyter server --port {port}` |
-| `python.venv` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
+| `python` | python | `python3 {bridge} --port {port}` |
+| `python.poetry` | python | `poetry run python {bridge} --port {port}` |
+| `python.venv` | python | `{cwd}/.venv/bin/python {bridge} --port {port}` |
+| `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` |
+| `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net')..."` |
 
 Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
 
+## Python Eval Notes
+
+The Python backend tries `compile(code, 'eval')` first (returns a value), then falls back to `compile(code, 'exec')` (no return value). This means:
+
+- **Single expressions** return values: `1 + 1` → `"2"`, `len(xs)` → `"42"`
+- **Multi-statement code** (`import x; expr`, multiline blocks) compiles as `exec` — no return value. Use `print()` or split into separate evals.
+- **For complex multiline code**, use `--file` or pipe via stdin to avoid shell quoting:
+
+```bash
+# Split imports and expressions into separate evals
+replsh eval --name py 'import pandas as pd'
+replsh eval --name py 'pd.read_csv("data.csv").shape'  # → returns value
+
+# Or use stdin for multiline
+replsh eval --name py --file /dev/stdin <<'EOF'
+import pandas as pd
+df = pd.read_csv('data.csv')
+print(df.dtypes)
+print(df.shape)
+EOF
+```
+
 ## Tips
 
 - Port is auto-allocated if not specified — just omit `--port`
-- Use `--init` to require namespaces on session start
+- Use `--init` to require namespaces or import modules on session start
 - Sessions persist across invocations — no need to re-launch
 - The REPL is your thinking tool. Use it early and often.
 - Timeout is graceful — you always get partial output, never a bare error

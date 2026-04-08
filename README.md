@@ -4,7 +4,7 @@
 
 A thinking medium for LLM agents. Bash gives agents hands — they can move files, invoke tools, run commands. replsh gives them a scratchpad — a persistent, stateful environment where they eval expressions, inspect runtime state, and test hypotheses before committing to code.
 
-Supports Clojure (deps.edn, Leiningen, Babashka), Python (Poetry, venv), and Node.js over their native protocols. All output is structured JSON. Sessions persist across invocations.
+Supports Clojure (deps.edn, Leiningen, Babashka), Python (native bridge — zero deps, or Jupyter for rich output), and Node.js over their native protocols. All output is structured JSON. Sessions persist across invocations.
 
 ## Why a REPL?
 
@@ -37,6 +37,7 @@ bb -m replsh.main --help
 # Launch a REPL (from project config or explicit)
 replsh launch --name dev
 replsh launch nrepl --name dev --cmd "bb --nrepl-server {port}"
+replsh launch python --name py --cmd "python3 {bridge} --port {port}"
 
 # Eval — the core loop
 replsh eval --name dev '(+ 1 2)'
@@ -119,8 +120,11 @@ replsh logs --name dev       # read server process logs
 | `clojure.deps` | nrepl | `clj -M:nrepl -m nrepl.cmdline --port {port}` |
 | `clojure.lein` | nrepl | `lein repl :headless :port {port}` |
 | `clojure.bb` | nrepl | `bb --nrepl-server {port}` |
-| `python.poetry` | jupyter | `poetry run jupyter server --port {port}` |
-| `python.venv` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
+| `python` | python | `python3 {bridge} --port {port}` |
+| `python.poetry` | python | `poetry run python {bridge} --port {port}` |
+| `python.venv` | python | `{cwd}/.venv/bin/python {bridge} --port {port}` |
+| `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` |
+| `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net').createServer(...)..."` |
 
 Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
@@ -146,7 +150,7 @@ CLI args + config → Session Config → state.edn
               sync / stream (NDJSON) / background (fork)
 ```
 
-- **Backends** (nREPL, Jupyter, Node) handle wire protocols via multimethods
+- **Backends** (nREPL, Python, Jupyter, Node) handle wire protocols via multimethods
 - **Eval modes** — sync (default), streaming (`--stream`), background (`--bg`)
 - **Timeout** — soft (partial output, exit 0) and hard (interrupt, exit 3)
 - **Process management** spawns/kills servers, tracks PIDs

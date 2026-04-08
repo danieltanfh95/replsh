@@ -3,6 +3,8 @@
             [replsh.backend.nrepl]
             [replsh.backend.node]
             [replsh.backend.jupyter]
+            [replsh.backend.python]
+            [replsh.bridge :as bridge]
             [replsh.process :as process]
             [replsh.state :as state]
             [replsh.output :as output]
@@ -34,7 +36,8 @@
   (let [transport (case backend-type
                     :nrepl   (merge {:type :tcp} (util/parse-address address))
                     :jupyter {:type :http :url url :token token}
-                    :node    (merge {:type :tcp} (util/parse-address address)))
+                    :node    (merge {:type :tcp} (util/parse-address address))
+                    :python  (merge {:type :tcp} (util/parse-address address)))
         session-config {:name         name
                         :backend      backend-type
                         :created-at   (util/timestamp)
@@ -70,6 +73,13 @@
   "Spawn a REPL server process, wait for readiness, connect, and register session."
   [{:keys [backend-type name host port cmd cwd env kernel token prompt-re init]}]
   (let [effective-cwd (or cwd (System/getProperty "user.dir"))
+        ;; Substitute template variables in cmd if not already resolved by config
+        cmd (-> cmd
+                (str/replace "{port}" (str port))
+                (str/replace "{host}" (or host "localhost"))
+                (str/replace "{cwd}" effective-cwd)
+                (str/replace "{bridge}" (try (bridge/ensure-bridge!)
+                                             (catch Exception _ ""))))
         ;; 1. Spawn the server process
         {:keys [pid process]} (process/spawn! {:cmd      cmd
                                                :cwd      effective-cwd
@@ -78,7 +88,7 @@
     (try
       ;; 2. Wait for port/HTTP readiness
       (case backend-type
-        (:nrepl :node)
+        (:nrepl :node :python)
         (process/wait-for-port! {:host       (or host "localhost")
                                  :port       port
                                  :timeout-ms 30000
@@ -94,7 +104,8 @@
                         :jupyter {:type :http
                                   :url (str "http://" (or host "localhost") ":" port)
                                   :token token}
-                        :node    {:type :tcp :host (or host "localhost") :port port})
+                        :node    {:type :tcp :host (or host "localhost") :port port}
+                        :python  {:type :tcp :host (or host "localhost") :port port})
             session-config {:name         name
                             :backend      backend-type
                             :created-at   (util/timestamp)
@@ -240,7 +251,7 @@
               (process/spawn! {:cmd cmd :cwd cwd :env-vars env-vars :name name})]
           (try
             (case (:backend session)
-              (:nrepl :node)
+              (:nrepl :node :python)
               (let [{:keys [host port]} (:transport session)]
                 (process/wait-for-port! {:host host :port port
                                          :timeout-ms 30000 :process new-process}))
@@ -308,12 +319,22 @@
     (when-not session
       (throw (ex-info (str "Session not found: " (or name "(no active session)"))
                       {:code :session-not-found})))
-    (let [live-state (backend/open! session)
-          result     (backend/interrupt! live-state)]
-      (backend/close! live-state)
-      (if (= :ok result)
-        (output/success :interrupt {:name (:name session)})
-        (output/failure :interrupt result)))))
+    ;; For backends that interrupt via PID (python, node), send SIGINT directly
+    ;; without opening a connection (which would block if the bridge is busy).
+    (if-let [pid (and (#{:python :node} (:backend session))
+                      (get-in session [:launch :pid]))]
+      (do
+        (try
+          (-> (ProcessBuilder. ["kill" "-2" (str pid)]) .start .waitFor)
+          (catch Exception _))
+        (output/success :interrupt {:name (:name session)}))
+      ;; For other backends, open a connection to send the interrupt protocol message
+      (let [live-state (backend/open! session)
+            result     (backend/interrupt! live-state)]
+        (backend/close! live-state)
+        (if (= :ok result)
+          (output/success :interrupt {:name (:name session)})
+          (output/failure :interrupt result))))))
 
 ;; --- Background eval ---
 

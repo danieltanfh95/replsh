@@ -1,6 +1,7 @@
 (ns replsh.config
   (:require [clojure.edn :as edn]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [replsh.bridge :as bridge])
   (:import [java.io File]))
 
 ;; --- Built-in toolchain presets ---
@@ -18,13 +19,25 @@
                      :cmd      "bb --nrepl-server {port}"
                      :defaults {:port 1667}}
 
-   "python.poetry"  {:backend  :jupyter
-                     :cmd      "poetry run jupyter server --port {port}"
-                     :defaults {:port 8888 :kernel "python3"}}
+   "python"         {:backend  :python
+                     :cmd      "python3 {bridge} --port {port}"
+                     :defaults {:port 9876}}
 
-   "python.venv"    {:backend  :jupyter
-                     :cmd      "{cwd}/.venv/bin/jupyter server --port {port}"
-                     :defaults {:port 8888 :kernel "python3"}}
+   "python.poetry"  {:backend  :python
+                     :cmd      "poetry run python {bridge} --port {port}"
+                     :defaults {:port 9876}}
+
+   "python.venv"    {:backend  :python
+                     :cmd      "{cwd}/.venv/bin/python {bridge} --port {port}"
+                     :defaults {:port 9876}}
+
+   "python.poetry.jupyter" {:backend  :jupyter
+                            :cmd      "poetry run jupyter server --port {port}"
+                            :defaults {:port 8888 :kernel "python3"}}
+
+   "python.venv.jupyter"   {:backend  :jupyter
+                            :cmd      "{cwd}/.venv/bin/jupyter server --port {port}"
+                            :defaults {:port 8888 :kernel "python3"}}
 
    "node"           {:backend  :node
                      :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port})\""
@@ -128,14 +141,15 @@
                      (assoc :backend-type (:backend merged)))
         ;; Substitute template variables in :cmd
         resolved (if (:cmd resolved)
-                   (let [template-vals {:port (or (:port resolved) "")
-                                        :cwd  cwd
-                                        :host (or (:host resolved) "localhost")}]
+                   (let [template-vals {:port   (or (:port resolved) "")
+                                        :cwd    cwd
+                                        :host   (or (:host resolved) "localhost")
+                                        :bridge (bridge/ensure-bridge!)}]
                      (update resolved :cmd substitute-template template-vals))
                    resolved)
         ;; Derive host from defaults if not set
         resolved (if (and (nil? (:host resolved))
-                          (#{:nrepl :node} (:backend-type resolved)))
+                          (#{:nrepl :node :python} (:backend-type resolved)))
                    (assoc resolved :host "localhost")
                    resolved)]
     resolved))

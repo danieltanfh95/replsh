@@ -38,7 +38,7 @@
       (let [bt (or backend-type (:backend-type resolved))]
         (cmd/start-cmd {:backend-type bt
                         :name         name
-                        :address      (when (#{:nrepl :node} bt)
+                        :address      (when (#{:nrepl :node :python} bt)
                                         (str (or (:host resolved) "localhost")
                                              ":" (:port resolved)))
                         :url          (when (= :jupyter bt)
@@ -58,7 +58,7 @@
           (throw (ex-info "Address or URL is required" {:code :missing-arg})))
         (cmd/start-cmd {:backend-type backend-type
                         :name         name
-                        :address      (when (#{:nrepl :node} backend-type) address)
+                        :address      (when (#{:nrepl :node :python} backend-type) address)
                         :url          (when (= :jupyter backend-type) url)
                         :cwd          cwd
                         :env          (parse-env env)
@@ -209,6 +209,8 @@
    {:cmds ["start" "node"]    :fn (partial start-handler :node)
     :spec (merge base-spec
                  {:prompt-re {:desc "Prompt string to detect" :default "> "}})}
+   {:cmds ["start" "python"]  :fn (partial start-handler :python)
+    :spec base-spec}
    {:cmds ["start"]           :fn (partial start-handler nil)
     :spec base-spec}
 
@@ -222,6 +224,8 @@
    {:cmds ["launch" "node"]    :fn (partial launch-handler :node)
     :spec (merge base-spec launch-extra
                  {:prompt-re {:desc "Prompt string to detect" :default "> "}})}
+   {:cmds ["launch" "python"]  :fn (partial launch-handler :python)
+    :spec (merge base-spec launch-extra)}
    {:cmds ["launch"]           :fn (partial launch-handler nil)
     :spec (merge base-spec launch-extra)}
 
@@ -271,7 +275,7 @@ Commands:
   output --eval-id <id>            Read background eval output
   logs   --name <name>             Read process logs
 
-Backends: nrepl, jupyter, node
+Backends: nrepl, python, jupyter, node
 
 Launch examples:
   replsh launch --name backend              # from .replsh/config.edn
@@ -295,7 +299,7 @@ Config files:
   <project>/.replsh/config.edn  Project session definitions
 
 Built-in toolchains: clojure.deps, clojure.lein, clojure.bb,
-                     python.poetry, python.venv, node
+                     python, python.poetry, python.venv, node
 
 All commands emit JSON to stdout. Exit codes: 0=ok, 1=eval error, 2=client error, 3=timeout
 

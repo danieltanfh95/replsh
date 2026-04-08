@@ -8,8 +8,8 @@ replsh \- unified CLI for REPL servers
 .RI [ options ]
 .SH DESCRIPTION
 .B replsh
-manages named sessions across nREPL, Jupyter, and Node.js REPL servers.
-It speaks each backend's native wire protocol (bencode, REST+WebSocket, raw TCP)
+manages named sessions across nREPL, Python, Jupyter, and Node.js REPL servers.
+It speaks each backend's native wire protocol (bencode, NDJSON/TCP, REST+WebSocket, raw TCP)
 and emits structured JSON on stdout for programmatic consumption.
 .PP
 Built for LLMs \(em all output is machine-readable. Named sessions abstract
@@ -26,7 +26,7 @@ Spawn a REPL server process, wait for readiness, and connect.
 .PP
 .I backend
 is one of
-.BR nrepl ", " jupyter ", " node .
+.BR nrepl ", " python ", " jupyter ", " node .
 Optional when using project config (derived from toolchain).
 .TP
 .BI \-\-name " name" "\fR, \fP" \-n " name"
@@ -77,7 +77,7 @@ When not using config,
 .I address
 is required as
 .IR host : port
-(nREPL/Node) or a URL (Jupyter).
+(nREPL/Python/Node) or a URL (Jupyter).
 .SS eval
 Evaluate code in a named session. Code can be provided as a positional argument,
 read from a file with
@@ -125,7 +125,7 @@ Restart a session. Re-launches the server process and re-runs init code.
 .B replsh restart
 .I name
 .SS interrupt
-Cancel a running evaluation (nREPL and Jupyter only).
+Cancel a running evaluation.
 .PP
 .B replsh interrupt \-\-name
 .I name
@@ -154,9 +154,9 @@ defines or overrides toolchain presets. Override path with
 .PP
 .nf
 {:toolchains
- {"python.conda" {:backend  :jupyter
-                  :cmd      "conda run jupyter server --port {port}"
-                  :defaults {:port 8888 :kernel "python3"}}}}
+ {"python.conda" {:backend  :python
+                  :cmd      "conda run python {bridge} --port {port}"
+                  :defaults {:port 9876}}}}
 .fi
 .SS Resolution order
 .PP
@@ -165,8 +165,10 @@ toolchain :defaults \(-> toolchain top-level \(-> session spec \(-> CLI args
 Each layer overrides the previous. CLI args always win.
 .SS Template variables
 Command strings support
-.BR {port} ", " {cwd} ", and " {host}
+.BR {port} ", " {cwd} ", " {host} ", and " {bridge}
 placeholders, substituted at resolution time.
+.B {bridge}
+resolves to the path of the auto-deployed Python bridge script.
 .SH TOOLCHAINS
 .TS
 l l l l.
@@ -175,8 +177,11 @@ _
 clojure.deps	nrepl	7888	clj -M:nrepl -m nrepl.cmdline --port {port}
 clojure.lein	nrepl	7888	lein repl :headless :port {port}
 clojure.bb	nrepl	1667	bb --nrepl-server {port}
-python.poetry	jupyter	8888	poetry run jupyter server --port {port}
-python.venv	jupyter	8888	{cwd}/.venv/bin/jupyter server --port {port}
+python	python	9876	python3 {bridge} --port {port}
+python.poetry	python	9876	poetry run python {bridge} --port {port}
+python.venv	python	9876	{cwd}/.venv/bin/python {bridge} --port {port}
+python.poetry.jupyter	jupyter	8888	poetry run jupyter server --port {port}
+python.venv.jupyter	jupyter	8888	{cwd}/.venv/bin/jupyter server --port {port}
 node	node	5001	node -e "require('net')..."
 .TE
 .SH OUTPUT FORMAT
@@ -232,6 +237,9 @@ Global toolchain configuration.
 .B ~/.replsh/logs/<name>.log
 Server process stdout/stderr logs.
 .TP
+.B ~/.replsh/bridge/replsh_bridge.py
+Python bridge script (auto-deployed).
+.TP
 .B <project>/.replsh/config.edn
 Project session configuration.
 .SH EXAMPLES
@@ -248,6 +256,8 @@ Launch with explicit args (port auto-allocated):
 .nf
 replsh launch nrepl --name dev \\
   --cmd "bb --nrepl-server {port}"
+replsh launch python --name py \\
+  --cmd "python3 {bridge} --port {port}"
 .fi
 .PP
 Launch with bootstrap code:

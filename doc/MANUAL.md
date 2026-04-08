@@ -6,7 +6,7 @@
 replsh <command> [options]
 ```
 
-Unified CLI for REPL servers. Manages named sessions across nREPL, Jupyter, and Node.js backends. All output is structured JSON.
+Unified CLI for REPL servers. Manages named sessions across nREPL, Python, Jupyter, and Node.js backends. All output is structured JSON.
 
 ## Commands
 
@@ -19,7 +19,7 @@ replsh launch [backend] --name <name> [options]
 ```
 
 **Arguments:**
-- `backend` — `nrepl`, `jupyter`, or `node`. Optional when using project config (derived from toolchain).
+- `backend` — `nrepl`, `python`, `jupyter`, or `node`. Optional when using project config (derived from toolchain).
 
 **Options:**
 
@@ -45,7 +45,13 @@ replsh launch --name backend
 # Explicit nREPL
 replsh launch nrepl --name dev --port 1667 --cmd "bb --nrepl-server 1667"
 
-# Jupyter with Poetry
+# Python (lightweight — no Jupyter required)
+replsh launch python --name py --cmd "python3 {bridge} --port {port}"
+
+# Python (Poetry environment)
+replsh launch python --name ml --cmd "poetry run python {bridge} --port {port}"
+
+# Jupyter with Poetry (for images/HTML/widgets)
 replsh launch jupyter --name ml --port 8888 \
   --cmd "poetry run jupyter server --port 8888" --kernel python3
 
@@ -62,8 +68,8 @@ replsh start [backend] --name <name> <address|url>
 ```
 
 **Arguments:**
-- `backend` — `nrepl`, `jupyter`, or `node`. Optional when using project config.
-- `address` — `host:port` for nREPL/Node, or URL for Jupyter (when not using config).
+- `backend` — `nrepl`, `python`, `jupyter`, or `node`. Optional when using project config.
+- `address` — `host:port` for nREPL/Python/Node, or URL for Jupyter (when not using config).
 
 Options are the same as `launch` minus `--cmd` and `--timeout`.
 
@@ -75,6 +81,9 @@ replsh start --name backend
 
 # Connect to nREPL
 replsh start nrepl --name dev --port 1667
+
+# Connect to Python bridge
+replsh start python --name py --port 9876
 
 # With init code
 replsh start --name dev --init "(in-ns 'my.ns)"
@@ -108,7 +117,7 @@ By default, `--timeout` is 30000ms (30 seconds). When the soft timeout fires:
 
 When `--hard-timeout` fires:
 
-- replsh sends an interrupt to the backend (nREPL interrupt op, Jupyter REST interrupt).
+- replsh sends an interrupt to the backend (nREPL interrupt op, Jupyter REST interrupt, SIGINT for Python/Node).
 - Returns as a **timeout error**: exit code 3.
 - Guaranteed to stop the eval.
 
@@ -144,6 +153,25 @@ echo '(+ 1 2)' | replsh eval --name dev
 replsh eval --name dev '(long-running-fn)' --timeout 60000
 replsh eval --name dev --stream '(run-tests)'
 replsh eval --name dev --bg '(train-model data)' --timeout 0 --hard-timeout 600000
+replsh eval --name py 'len(my_list)'
+replsh eval --name py --file /dev/stdin <<< 'import os; print(os.getcwd())'
+```
+
+#### Python: expression vs statement
+
+The Python backend tries to compile code as an expression first (to return a value). If that fails, it falls back to statement mode (no return value). This means:
+
+- **Single expressions** return values: `1 + 1` → `"2"`, `len(xs)` → `"42"`
+- **Multi-statement code** (separated by `;` or newlines) compiles as statements — no return value. Use `print()` or split into separate evals.
+- **For complex multiline code**, use `--file` or pipe via stdin to avoid shell quoting issues:
+
+```bash
+replsh eval --name py --file /dev/stdin <<'EOF'
+import pandas as pd
+df = pd.read_csv('data.csv')
+print(df.dtypes)
+print(df.shape)
+EOF
 ```
 
 ### ls
@@ -180,11 +208,13 @@ replsh restart <name>
 
 ### interrupt
 
-Cancel a running evaluation (nREPL and Jupyter only).
+Cancel a running evaluation.
 
 ```
 replsh interrupt --name <name>
 ```
+
+Supported by all backends: nREPL (interrupt op), Jupyter (REST interrupt), Python (SIGINT), Node (SIGINT).
 
 ### evals
 
@@ -244,9 +274,7 @@ Searched from the current working directory upward to the filesystem root (like 
               :port      1667
               :init      "(require '[my.app])"}
   "ml"       {:toolchain "python.poetry"
-              :port      8888
-              :cwd       "ml/"
-              :kernel    "python3"}}}
+              :cwd       "ml/"}}}
 ```
 
 **Session fields:**
@@ -269,9 +297,9 @@ Define or override toolchain presets. Override path with `REPLSH_CONFIG_GLOBAL`.
 
 ```clojure
 {:toolchains
- {"python.conda" {:backend  :jupyter
-                  :cmd      "conda run jupyter server --port {port}"
-                  :defaults {:port 8888 :kernel "python3"}}}}
+ {"python.conda" {:backend  :python
+                  :cmd      "conda run python {bridge} --port {port}"
+                  :defaults {:port 9876}}}}
 ```
 
 ### Resolution order
@@ -284,12 +312,14 @@ Each layer overrides the previous. CLI args always win.
 
 ### Template variables
 
-Command strings support `{port}`, `{cwd}`, and `{host}` placeholders, substituted at resolution time.
+Command strings support `{port}`, `{cwd}`, `{host}`, and `{bridge}` placeholders, substituted at resolution time.
 
 ```clojure
-:cmd "{cwd}/.venv/bin/jupyter server --port {port}"
-;; becomes: /project/ml/.venv/bin/jupyter server --port 8888
+:cmd "{cwd}/.venv/bin/python {bridge} --port {port}"
+;; becomes: /project/ml/.venv/bin/python /home/user/.replsh/bridge/replsh_bridge.py --port 9876
 ```
+
+`{bridge}` resolves to the path of the Python bridge script, automatically deployed to `~/.replsh/bridge/replsh_bridge.py`.
 
 ## Toolchains
 
@@ -300,8 +330,11 @@ Command strings support `{port}`, `{cwd}`, and `{host}` placeholders, substitute
 | `clojure.deps` | nrepl | `clj -M:nrepl -m nrepl.cmdline --port {port}` | port 7888 |
 | `clojure.lein` | nrepl | `lein repl :headless :port {port}` | port 7888 |
 | `clojure.bb` | nrepl | `bb --nrepl-server {port}` | port 1667 |
-| `python.poetry` | jupyter | `poetry run jupyter server --port {port}` | port 8888, kernel python3 |
-| `python.venv` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` | port 8888, kernel python3 |
+| `python` | python | `python3 {bridge} --port {port}` | port 9876 |
+| `python.poetry` | python | `poetry run python {bridge} --port {port}` | port 9876 |
+| `python.venv` | python | `{cwd}/.venv/bin/python {bridge} --port {port}` | port 9876 |
+| `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` | port 8888, kernel python3 |
+| `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` | port 8888, kernel python3 |
 | `node` | node | `node -e "require('net')..."` | port 5001, prompt "> " |
 
 ## Output Format
@@ -402,4 +435,5 @@ NDJSON — one JSON line per chunk, final line is the summary envelope:
 | `~/.replsh/evals/<id>.jsonl` | Background eval NDJSON output |
 | `~/.replsh/evals/<id>.meta.edn` | Background eval metadata (status, timestamps, PID) |
 | `~/.replsh/evals/<id>.code` | Background eval source code |
+| `~/.replsh/bridge/replsh_bridge.py` | Python bridge script (auto-deployed) |
 | `<project>/.replsh/config.edn` | Project session config |
