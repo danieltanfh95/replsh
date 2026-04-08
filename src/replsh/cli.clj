@@ -236,7 +236,9 @@ Config files:
 Built-in toolchains: clojure.deps, clojure.lein, clojure.bb,
                      python.poetry, python.venv, node
 
-All commands emit JSON to stdout. Exit codes: 0=ok, 1=eval error, 2=client error, 3=timeout")
+All commands emit JSON to stdout. Exit codes: 0=ok, 1=eval error, 2=client error, 3=timeout
+
+Run 'man replsh' or see doc/MANUAL.md for the full reference.")
 
 (defn dispatch
   [args]

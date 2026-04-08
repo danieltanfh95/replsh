@@ -1,0 +1,254 @@
+.\" replsh - Unified CLI for REPL servers
+.TH REPLSH 1 "April 2026" "replsh" "User Commands"
+.SH NAME
+replsh \- unified CLI for REPL servers
+.SH SYNOPSIS
+.B replsh
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B replsh
+manages named sessions across nREPL, Jupyter, and Node.js REPL servers.
+It speaks each backend's native wire protocol (bencode, REST+WebSocket, raw TCP)
+and emits structured JSON on stdout for programmatic consumption.
+.PP
+Built for LLMs \(em all output is machine-readable. Named sessions abstract
+away connection details and persist across CLI invocations.
+.SH COMMANDS
+.SS launch
+Spawn a REPL server process, wait for readiness, and connect.
+.PP
+.B replsh launch
+.RI [ backend ]
+.B \-\-name
+.I name
+.RI [ options ]
+.PP
+.I backend
+is one of
+.BR nrepl ", " jupyter ", " node .
+Optional when using project config (derived from toolchain).
+.TP
+.BI \-\-name " name" "\fR, \fP" \-n " name"
+Session name (required).
+.TP
+.BI \-\-port " port" "\fR, \fP" \-p " port"
+Port number.
+.TP
+.BI \-\-cmd " command"
+Shell command to spawn the REPL server.
+.TP
+.BI \-\-cwd " dir"
+Working directory for the server process.
+.TP
+.BI \-\-env " K=V" "\fR, \fP" \-e " K=V"
+Environment variable (repeatable).
+.TP
+.BI \-\-init " code" "\fR, \fP" \-i " code"
+Bootstrap code to evaluate after connecting.
+.TP
+.BI \-\-timeout " ms" "\fR, \fP" \-t " ms"
+Port readiness timeout in milliseconds (default: 30000).
+.TP
+.BI \-\-kernel " name" "\fR, \fP" \-k " name"
+Jupyter kernel name (default: python3).
+.TP
+.BI \-\-token " token"
+Jupyter authentication token.
+.TP
+.BI \-\-prompt\-re " string"
+Node.js prompt detection string (default: "> ").
+.SS start
+Connect to an already-running REPL server.
+.PP
+.B replsh start
+.RI [ backend ]
+.B \-\-name
+.I name
+.RI [ address ]
+.PP
+Same options as
+.B launch
+except
+.B \-\-cmd
+and
+.BR \-\-timeout .
+When not using config,
+.I address
+is required as
+.IR host : port
+(nREPL/Node) or a URL (Jupyter).
+.SS eval
+Evaluate code in a named session.
+.PP
+.B replsh eval \-\-name
+.I name
+.I code
+.TP
+.BI \-\-name " name" "\fR, \fP" \-n " name"
+Session name.
+.TP
+.BI \-\-timeout " ms" "\fR, \fP" \-t " ms"
+Evaluation timeout in milliseconds (default: 30000).
+.SS ls
+List all sessions.
+.PP
+.B replsh ls
+.SS status
+Show detailed status for a session including reachability and process info.
+.PP
+.B replsh status \-\-name
+.I name
+.SS stop
+Stop and remove a session. Kills the server process if launched by replsh.
+.PP
+.B replsh stop
+.I name
+.SS restart
+Restart a session. Re-launches the server process and re-runs init code.
+.PP
+.B replsh restart
+.I name
+.SS interrupt
+Cancel a running evaluation (nREPL and Jupyter only).
+.PP
+.B replsh interrupt \-\-name
+.I name
+.SH CONFIGURATION
+.SS Project config
+.B .replsh/config.edn
+is searched from the current working directory upward to the filesystem root.
+Override with the
+.B REPLSH_CONFIG
+environment variable.
+.PP
+.nf
+{:sessions
+ {"backend" {:toolchain "clojure.bb"
+             :port      1667
+             :init      "(require '[my.app])"}}}
+.fi
+.PP
+Session fields:
+.BR :toolchain ", " :port ", " :cmd ", " :cwd ", " :init ", "
+.BR :kernel ", " :token ", " :prompt\-re ", " :env .
+.SS Global config
+.B ~/.replsh/config.edn
+defines or overrides toolchain presets. Override path with
+.BR REPLSH_CONFIG_GLOBAL .
+.PP
+.nf
+{:toolchains
+ {"python.conda" {:backend  :jupyter
+                  :cmd      "conda run jupyter server --port {port}"
+                  :defaults {:port 8888 :kernel "python3"}}}}
+.fi
+.SS Resolution order
+.PP
+toolchain :defaults \(-> toolchain top-level \(-> session spec \(-> CLI args
+.PP
+Each layer overrides the previous. CLI args always win.
+.SS Template variables
+Command strings support
+.BR {port} ", " {cwd} ", and " {host}
+placeholders, substituted at resolution time.
+.SH TOOLCHAINS
+.TS
+l l l l.
+Name	Backend	Default Port	Command
+_
+clojure.deps	nrepl	7888	clj -M:nrepl -m nrepl.cmdline --port {port}
+clojure.lein	nrepl	7888	lein repl :headless :port {port}
+clojure.bb	nrepl	1667	bb --nrepl-server {port}
+python.poetry	jupyter	8888	poetry run jupyter server --port {port}
+python.venv	jupyter	8888	{cwd}/.venv/bin/jupyter server --port {port}
+node	node	5001	node -e "require('net')..."
+.TE
+.SH OUTPUT FORMAT
+All commands emit exactly one JSON object on stdout.
+.PP
+Success:
+.nf
+{"ok": true, "command": "eval", "data": {"value": "3", ...}}
+.fi
+.PP
+Error:
+.nf
+{"ok": false, "command": "eval", "error": {"code": "eval_error", ...}}
+.fi
+.PP
+Chunk types:
+.BR out " (stdout), "
+.BR err " (stderr), "
+.BR value " (return value), "
+.BR error " (evaluation error), "
+.BR status .
+.SH EXIT CODES
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Evaluation error (code ran but produced an error).
+.TP
+.B 2
+Client error (connection failed, session not found, bad arguments).
+.TP
+.B 3
+Timeout.
+.SH ENVIRONMENT
+.TP
+.B REPLSH_CONFIG
+Override project config file path.
+.TP
+.B REPLSH_CONFIG_GLOBAL
+Override global config file path.
+.TP
+.B REPLSH_STATE
+Override state file path (default: ~/.replsh/state.edn).
+.SH FILES
+.TP
+.B ~/.replsh/state.edn
+Persisted session state.
+.TP
+.B ~/.replsh/config.edn
+Global toolchain configuration.
+.TP
+.B ~/.replsh/logs/<name>.log
+Server process stdout/stderr logs.
+.TP
+.B <project>/.replsh/config.edn
+Project session configuration.
+.SH EXAMPLES
+Launch from project config:
+.PP
+.nf
+replsh launch --name backend
+replsh eval --name backend '(+ 1 2)'
+replsh stop backend
+.fi
+.PP
+Launch with explicit args:
+.PP
+.nf
+replsh launch nrepl --name dev --port 1667 \\
+  --cmd "bb --nrepl-server 1667"
+.fi
+.PP
+Launch with bootstrap code:
+.PP
+.nf
+replsh launch --name dev \\
+  --init "(require '[clojure.string :as str])"
+replsh eval --name dev '(str/upper-case "hello")'
+.fi
+.SH SEE ALSO
+.BR bb (1),
+.BR nrepl (7),
+.BR jupyter (1)
+.PP
+Full documentation: https://github.com/g-daniel/replsh
+.SH LICENSE
+Eclipse Public License 2.0
+.SH AUTHORS
+Daniel Tan

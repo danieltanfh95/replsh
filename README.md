@@ -1,5 +1,7 @@
 # replsh
 
+[![License: EPL 2.0](https://img.shields.io/badge/License-EPL%202.0-blue.svg)](https://www.eclipse.org/legal/epl-2.0/)
+
 Unified CLI for REPL servers. One tool to talk to nREPL, Jupyter, and Node.js REPLs.
 
 Built for LLMs — all output is structured JSON. Named sessions abstract away connection details.
@@ -9,7 +11,12 @@ Built for LLMs — all output is structured JSON. Named sessions abstract away c
 Requires [Babashka](https://babashka.org/).
 
 ```bash
-# Clone and run directly
+# Via bbin (recommended)
+bbin install io.github.g-daniel/replsh
+
+# Or clone and run directly
+git clone https://github.com/g-daniel/replsh.git
+cd replsh
 bb -m replsh.main --help
 ```
 
@@ -87,6 +94,25 @@ Add or override toolchain presets:
 | `python.venv` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net').createServer(...)..."` |
 
+## Output Format
+
+All commands emit JSON to stdout:
+
+```json
+{"ok": true, "command": "eval", "data": {"value": "3", "ns": "user", ...}}
+{"ok": false, "command": "eval", "error": {"code": "eval_error", "message": "..."}}
+```
+
+Exit codes: `0` success, `1` eval error, `2` client error, `3` timeout.
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `REPLSH_CONFIG` | Override project config path |
+| `REPLSH_CONFIG_GLOBAL` | Override global config path |
+| `REPLSH_STATE` | Override state file path |
+
 ## Architecture
 
 ```
@@ -100,4 +126,14 @@ CLI args + config → Resolved Spec → Session Config → state.edn
 - **Config resolution** merges toolchain presets → project sessions → CLI args
 - **State** persists sessions to `~/.replsh/state.edn` — no daemon needed
 
-See [SKILL.md](SKILL.md) for the LLM-oriented reference, [doc/BACKENDS.md](doc/BACKENDS.md) for backend comparison.
+## Documentation
+
+- [Full manual](doc/MANUAL.md) — complete command reference
+- [Backend comparison](doc/BACKENDS.md) — protocol capabilities
+- [Prior art](doc/PRIOR_ART.md) — landscape survey
+- [LLM skill document](SKILL.md) — agent-oriented reference
+- `man replsh` — Unix manual page
+
+## License
+
+[Eclipse Public License 2.0](LICENSE)
