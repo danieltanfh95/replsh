@@ -1,4 +1,7 @@
-{:paths ["src"]
+{:paths ["src" "test"]
  :deps {org.babashka/cli {:mvn/version "0.8.61"}
         cheshire/cheshire {:mvn/version "5.13.0"}}
- :main replsh.main}
+ :main replsh.main
+ :license {:name "EPL-2.0"
+           :url "https://www.eclipse.org/legal/epl-2.0/"}
+ :bbin/bin {replsh {:main-opts ["-m" "replsh.main"]}}}

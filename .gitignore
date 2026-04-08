@@ -1,0 +1,19 @@
+# Editor/tool caches
+.clj-kondo/.cache/
+.lsp/
+.claude/
+
+# Clojure build artifacts
+.nrepl-port
+.cpcache/
+target/
+
+# replsh runtime state
+.replsh/state.edn
+.replsh/logs/
+
+# Plans (development only)
+.plans/
+
+# Logs
+*.log
