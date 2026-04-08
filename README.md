@@ -156,7 +156,7 @@ replsh stop dev
 - [Full manual](doc/MANUAL.md) — complete command reference
 - [Backend comparison](doc/BACKENDS.md) — protocol capabilities
 - [Prior art](doc/PRIOR_ART.md) — landscape survey
-- [LLM skill document](SKILL.md) — agent-oriented reference
+- [LLM skill document](skills/replsh/SKILL.md) — agent-oriented reference ([skills.sh](https://skills.sh/) compatible)
 - `man replsh` — Unix manual page
 
 ## License

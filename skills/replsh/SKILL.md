@@ -1,11 +1,60 @@
-# replsh — LLM Skill Document
+---
+name: replsh
+description: >
+  Use replsh to manage and evaluate code in REPL sessions across Clojure
+  (deps.edn, Leiningen, Babashka), Python (Poetry, venv), and Node.js.
+  Activate when the user wants to eval code interactively, run tests in a
+  live REPL, or when the project has a .replsh/config.edn file.
+license: EPL-2.0
+compatibility: Requires Babashka (bb) installed. REPL servers started by replsh or running externally.
+metadata:
+  author: Daniel Tan
+  repository: https://github.com/g-daniel/replsh
+---
 
-You have access to `replsh`, a CLI tool for interacting with REPL servers (nREPL, Jupyter, Node.js). Use it to evaluate code, test functions, and iterate in interactive environments.
+# replsh
+
+Unified CLI for REPL servers. Manages named sessions across nREPL (Clojure), Jupyter (Python), and Node.js backends. All output is structured JSON — built for LLMs.
+
+## Installation
+
+Check if replsh is available:
+
+```bash
+which bb && which replsh
+```
+
+If Babashka is not installed:
+
+```bash
+# macOS
+brew install borkdude/brew/babashka
+
+# Linux
+curl -sLO https://raw.githubusercontent.com/babashka/babashka/master/install
+chmod +x install && sudo ./install
+```
+
+Install replsh:
+
+```bash
+# Via bbin (recommended)
+bbin install io.github.g-daniel/replsh
+
+# Or clone and run directly
+git clone https://github.com/g-daniel/replsh.git
+cd replsh && bb -m replsh.main --help
+```
+
+If running from a clone, substitute `replsh` with `bb -m replsh.main` in all commands below.
 
 ## Quick Reference
 
 ```bash
-# Launch a REPL server + connect (from project config)
+# Launch a REPL server + connect (port auto-allocated)
+replsh launch --name <session>
+
+# Launch from project config
 replsh launch --name <session>
 
 # Launch with explicit args
@@ -19,10 +68,8 @@ replsh eval --name <session> '<code>'
 replsh eval --name <session> --file <path>
 echo '<code>' | replsh eval --name <session>
 
-# List sessions
-replsh ls
-
 # Session lifecycle
+replsh ls
 replsh status --name <session>
 replsh restart <session>
 replsh stop <session>
@@ -47,15 +94,19 @@ Exit codes: 0=success, 1=eval error, 2=client error, 3=timeout.
 Look for `.replsh/config.edn` in the project root. If it exists, sessions are pre-configured:
 
 ```bash
-replsh launch --name backend    # launch from config
+replsh launch --name backend
 replsh eval --name backend '(+ 1 2)'
 ```
 
 ### 2. Launch without config
 
 ```bash
-# Clojure (Babashka nREPL)
-replsh launch nrepl --name dev --port 1667 --cmd "bb --nrepl-server 1667"
+# Clojure (Babashka nREPL) — port auto-allocated
+replsh launch nrepl --name dev --cmd "bb --nrepl-server {port}"
+
+# Clojure (deps.edn) — explicit port
+replsh launch nrepl --name dev --port 7888 \
+  --cmd "clj -M:nrepl -m nrepl.cmdline --port 7888"
 
 # Python (Jupyter via Poetry)
 replsh launch jupyter --name ml --port 8888 \
@@ -69,14 +120,14 @@ replsh launch node --name frontend --port 5001 \
 ### 3. Evaluate and iterate
 
 ```bash
+# Inline
 replsh eval --name dev '(defn greet [name] (str "Hello, " name))'
 replsh eval --name dev '(greet "world")'
-replsh eval --name ml 'import pandas as pd; df = pd.read_csv("data.csv"); print(df.shape)'
 
 # From a file
 replsh eval --name dev --file src/my/script.clj
 
-# From stdin (pipe)
+# From stdin
 echo '(+ 1 2)' | replsh eval --name dev
 cat script.clj | replsh eval --name dev
 ```
@@ -86,15 +137,14 @@ cat script.clj | replsh eval --name dev
 Run setup code when creating a session:
 
 ```bash
-replsh launch nrepl --name dev --port 1667 \
-  --cmd "bb --nrepl-server 1667" \
+replsh launch nrepl --name dev --cmd "bb --nrepl-server {port}" \
   --init "(require '[my.app :as app])"
 ```
 
 ### 5. Clean up
 
 ```bash
-replsh stop dev       # stops server (if launched) and removes session
+replsh stop dev
 replsh ls             # verify
 ```
 
@@ -113,7 +163,16 @@ replsh ls             # verify
               :kernel    "python3"}}}
 ```
 
-### Built-in toolchains
+### Global config (`~/.replsh/config.edn`)
+
+```clojure
+{:toolchains
+ {"python.conda" {:backend  :jupyter
+                  :cmd      "conda run jupyter server --port {port}"
+                  :defaults {:port 8888 :kernel "python3"}}}}
+```
+
+## Built-in Toolchains
 
 | Name | Backend | Default command |
 |------|---------|----------------|
@@ -166,3 +225,4 @@ replsh ls             # verify
 - `replsh status --name <name>` shows reachability and process info
 - Sessions persist across CLI invocations — `replsh eval` reconnects each time
 - For multi-project setups, create multiple named sessions
+- Config files use `{port}`, `{cwd}`, `{host}` template variables in commands
