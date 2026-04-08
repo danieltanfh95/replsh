@@ -217,6 +217,7 @@ Commands:
   launch [backend] --name <name>   Spawn a REPL server and connect
   start  [backend] --name <name>   Connect to an existing REPL server
   eval   --name <name> '<code>'    Evaluate code in a session
+  eval   --name <name> --file <f>   Evaluate code from file (or stdin)
   ls                               List all sessions
   status --name <name>             Show session status
   stop   <name>                    Stop and remove a session
@@ -227,8 +228,13 @@ Backends: nrepl, jupyter, node
 
 Launch examples:
   replsh launch --name backend              # from .replsh/config.edn
-  replsh launch nrepl --name dev --port 1667 --cmd \"bb --nrepl-server 1667\"
+  replsh launch nrepl --name dev --cmd \"bb --nrepl-server {port}\"
   replsh launch --name ml --init \"import pandas\"
+
+Eval examples:
+  replsh eval --name dev '(+ 1 2)'          # inline code
+  replsh eval --name dev --file script.clj  # from file
+  echo '(+ 1 2)' | replsh eval --name dev  # from stdin
 
 Start examples (connect to existing server):
   replsh start nrepl --name dev --port 1667

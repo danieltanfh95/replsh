@@ -33,7 +33,7 @@ Optional when using project config (derived from toolchain).
 Session name (required).
 .TP
 .BI \-\-port " port" "\fR, \fP" \-p " port"
-Port number.
+Port number. If omitted, a free port is automatically allocated.
 .TP
 .BI \-\-cmd " command"
 Shell command to spawn the REPL server.
@@ -79,17 +79,32 @@ is required as
 .IR host : port
 (nREPL/Node) or a URL (Jupyter).
 .SS eval
-Evaluate code in a named session.
+Evaluate code in a named session. Code can be provided as a positional argument,
+read from a file with
+.BR \-\-file ,
+or piped via stdin (when no argument or file is given).
 .PP
 .B replsh eval \-\-name
 .I name
-.I code
+.RI [ code ]
 .TP
 .BI \-\-name " name" "\fR, \fP" \-n " name"
 Session name.
 .TP
+.BI \-\-file " path" "\fR, \fP" \-f " path"
+Read code from a file instead of a positional argument.
+.TP
 .BI \-\-timeout " ms" "\fR, \fP" \-t " ms"
 Evaluation timeout in milliseconds (default: 30000).
+.PP
+If neither a positional argument nor
+.B \-\-file
+is given, code is read from standard input. This allows piping:
+.PP
+.nf
+echo '(+ 1 2)' | replsh eval \-\-name dev
+cat script.clj | replsh eval \-\-name dev
+.fi
 .SS ls
 List all sessions.
 .PP
@@ -228,11 +243,11 @@ replsh eval --name backend '(+ 1 2)'
 replsh stop backend
 .fi
 .PP
-Launch with explicit args:
+Launch with explicit args (port auto-allocated):
 .PP
 .nf
-replsh launch nrepl --name dev --port 1667 \\
-  --cmd "bb --nrepl-server 1667"
+replsh launch nrepl --name dev \\
+  --cmd "bb --nrepl-server {port}"
 .fi
 .PP
 Launch with bootstrap code:
@@ -241,6 +256,13 @@ Launch with bootstrap code:
 replsh launch --name dev \\
   --init "(require '[clojure.string :as str])"
 replsh eval --name dev '(str/upper-case "hello")'
+.fi
+.PP
+Eval from file or stdin:
+.PP
+.nf
+replsh eval --name dev --file script.clj
+echo '(+ 1 2)' | replsh eval --name dev
 .fi
 .SH SEE ALSO
 .BR bb (1),

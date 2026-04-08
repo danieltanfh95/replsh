@@ -26,7 +26,7 @@ replsh launch [backend] --name <name> [options]
 | Flag | Alias | Description |
 |------|-------|-------------|
 | `--name` | `-n` | Session name (required) |
-| `--port` | `-p` | Port number |
+| `--port` | `-p` | Port number (auto-allocated if omitted) |
 | `--cmd` | | Command to spawn the server |
 | `--cwd` | | Working directory |
 | `--env` | `-e` | Environment variable (`K=V`, repeatable) |
@@ -82,15 +82,18 @@ replsh start --name dev --init "(in-ns 'my.ns)"
 
 ### eval
 
-Evaluate code in a named session.
+Evaluate code in a named session. Code can be provided as a positional argument, read from a file with `--file`, or piped via stdin (when neither argument nor file is given).
 
 ```
 replsh eval --name <name> '<code>'
+replsh eval --name <name> --file <path>
+echo '<code>' | replsh eval --name <name>
 ```
 
 | Flag | Alias | Description |
 |------|-------|-------------|
 | `--name` | `-n` | Session name |
+| `--file` | `-f` | Read code from file |
 | `--timeout` | `-t` | Eval timeout in ms (default: 30000) |
 
 **Examples:**
@@ -98,6 +101,8 @@ replsh eval --name <name> '<code>'
 ```bash
 replsh eval --name dev '(+ 1 2)'
 replsh eval --name ml 'import pandas; print(pandas.__version__)'
+replsh eval --name dev --file script.clj
+echo '(+ 1 2)' | replsh eval --name dev
 replsh eval --name dev '(long-running-fn)' --timeout 60000
 ```
 
