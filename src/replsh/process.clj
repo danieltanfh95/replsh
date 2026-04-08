@@ -25,7 +25,7 @@
   [{:keys [cmd cwd env-vars name]}]
   (ensure-log-dir!)
   (let [log-file (File. (str log-dir name ".log"))
-        pb       (ProcessBuilder. ^java.util.List ["/bin/sh" "-c" cmd])]
+        pb       (ProcessBuilder. ^java.util.List ["/bin/sh" "-c" (str "exec " cmd)])]
     (.redirectErrorStream pb true)
     (.redirectOutput pb (ProcessBuilder$Redirect/appendTo log-file))
     (when cwd

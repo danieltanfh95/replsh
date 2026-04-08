@@ -13,7 +13,8 @@
       (let [data    (ex-data e)
             command (or (:command data) "error")]
         (output/emit! (output/failure command
-                                      {:code    (or (:code data) "unknown")
+                                      {:code    (let [c (or (:code data) "unknown")]
+                                                  (if (keyword? c) (name c) (str c)))
                                        :message (ex-message e)
                                        :detail  (dissoc data :code :command)}))
         (System/exit 2)))
