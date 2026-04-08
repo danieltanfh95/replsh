@@ -16,6 +16,8 @@ replsh start nrepl --name <session> --port <port>
 
 # Evaluate code
 replsh eval --name <session> '<code>'
+replsh eval --name <session> --file <path>
+echo '<code>' | replsh eval --name <session>
 
 # List sessions
 replsh ls
@@ -70,6 +72,13 @@ replsh launch node --name frontend --port 5001 \
 replsh eval --name dev '(defn greet [name] (str "Hello, " name))'
 replsh eval --name dev '(greet "world")'
 replsh eval --name ml 'import pandas as pd; df = pd.read_csv("data.csv"); print(df.shape)'
+
+# From a file
+replsh eval --name dev --file src/my/script.clj
+
+# From stdin (pipe)
+echo '(+ 1 2)' | replsh eval --name dev
+cat script.clj | replsh eval --name dev
 ```
 
 ### 4. Bootstrap with --init
@@ -151,6 +160,7 @@ replsh ls             # verify
 
 ## Tips
 
+- Port is auto-allocated if not specified — no need for `--port` in most cases
 - Use `--timeout` on eval for long-running operations (default 30s)
 - `replsh restart <name>` re-launches the server and re-runs init code
 - `replsh status --name <name>` shows reachability and process info

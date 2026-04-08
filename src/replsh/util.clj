@@ -1,5 +1,6 @@
 (ns replsh.util
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str])
+  (:import [java.net ServerSocket]))
 
 (defn gen-id
   "Generate a short random ID with an optional prefix."
@@ -19,6 +20,12 @@
       1 {:host "localhost" :port (parse-long (first parts))}
       2 {:host (first parts) :port (parse-long (second parts))}
       (throw (ex-info (str "Invalid address: " s) {:address s})))))
+
+(defn find-free-port
+  "Find a free TCP port. Binds to port 0, reads assigned port, closes."
+  []
+  (with-open [sock (ServerSocket. 0)]
+    (.getLocalPort sock)))
 
 (defn parse-env-args
   "Parse a sequence of 'K=V' strings into a map."

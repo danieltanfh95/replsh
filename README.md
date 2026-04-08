@@ -2,7 +2,7 @@
 
 [![License: EPL 2.0](https://img.shields.io/badge/License-EPL%202.0-blue.svg)](https://www.eclipse.org/legal/epl-2.0/)
 
-Unified CLI for REPL servers. One tool to talk to nREPL, Jupyter, and Node.js REPLs.
+Unified CLI for REPL servers. One tool to talk to Clojure (deps.edn, Leiningen, Babashka), Python (Poetry, venv), and Node.js — over their native protocols.
 
 Built for LLMs — all output is structured JSON. Named sessions abstract away connection details.
 
@@ -125,6 +125,31 @@ CLI args + config → Resolved Spec → Session Config → state.edn
 - **Process management** spawns/kills server processes for `launch`
 - **Config resolution** merges toolchain presets → project sessions → CLI args
 - **State** persists sessions to `~/.replsh/state.edn` — no daemon needed
+
+## Development
+
+replsh is developed using replsh. The project includes `.replsh/config.edn` with a `dev` session:
+
+```bash
+# Launch a dev REPL (port auto-allocated)
+replsh launch --name dev
+
+# Run unit tests through the REPL
+replsh eval --name dev \
+  '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :unit-only? true)'
+
+# Run all tests (unit + integration)
+replsh eval --name dev \
+  '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all)' \
+  --timeout 120000
+
+# Or run tests directly (cold start)
+bb -m replsh.test-runner          # all tests
+bb -m replsh.test-runner --unit   # unit only
+
+# Clean up
+replsh stop dev
+```
 
 ## Documentation
 

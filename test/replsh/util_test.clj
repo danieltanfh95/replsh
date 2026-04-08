@@ -31,6 +31,16 @@
     (is (thrown? clojure.lang.ExceptionInfo
                 (util/parse-address "a:b:c")))))
 
+(deftest find-free-port-test
+  (testing "returns a valid port number"
+    (let [port (util/find-free-port)]
+      (is (integer? port))
+      (is (> port 0))
+      (is (< port 65536))))
+
+  (testing "each call returns a different port"
+    (is (not= (util/find-free-port) (util/find-free-port)))))
+
 (deftest parse-env-args-test
   (testing "parses K=V pairs"
     (is (= {"FOO" "bar" "BAZ" "qux"}

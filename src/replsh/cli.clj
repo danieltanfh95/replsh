@@ -70,13 +70,13 @@
 (defn- launch-handler
   [backend-type {:keys [opts args]}]
   (let [{:keys [name cmd cwd env kernel token prompt-re init port timeout]} opts
+        port (or port (util/find-free-port))
         ;; Try config resolution
-        resolved (resolve-config name (cond-> {}
+        resolved (resolve-config name (cond-> {:port port}
                                         cmd       (assoc :cmd cmd)
                                         cwd       (assoc :cwd cwd)
                                         env       (assoc :env (parse-env env))
                                         init      (assoc :init init)
-                                        port      (assoc :port port)
                                         kernel    (assoc :kernel kernel)
                                         token     (assoc :token token)
                                         prompt-re (assoc :prompt-re prompt-re)))]
@@ -107,8 +107,6 @@
                           {:code :missing-arg})))
         (when-not cmd
           (throw (ex-info "--cmd is required" {:code :missing-arg})))
-        (when-not port
-          (throw (ex-info "--port is required" {:code :missing-arg})))
         (cmd/launch-cmd {:backend-type backend-type
                          :name         name
                          :host         "localhost"
@@ -124,9 +122,15 @@
 
 (defn- eval-handler
   [{:keys [opts args]}]
-  (let [code (first args)]
-    (when-not code
-      (throw (ex-info "Code argument is required" {:code :missing-arg})))
+  (let [file (:file opts)
+        code (cond
+               file          (slurp file)
+               (first args)  (first args)
+               :else         (let [input (slurp *in*)]
+                               (when (empty? input)
+                                 (throw (ex-info "No code provided (pass as argument, --file, or pipe to stdin)"
+                                                 {:code :missing-arg})))
+                               input))]
     (cmd/eval-cmd {:name    (:name opts)
                    :code    code
                    :timeout (:timeout opts)})))
@@ -192,7 +196,8 @@
    ;; Other commands
    {:cmds ["eval"]             :fn eval-handler
     :spec {:name    {:alias :n :desc "Session name"}
-           :timeout {:alias :t :desc "Timeout in ms" :coerce :long :default 30000}}}
+           :timeout {:alias :t :desc "Timeout in ms" :coerce :long :default 30000}
+           :file    {:alias :f :desc "Read code from file (use /dev/stdin for stdin)" :coerce :string}}}
    {:cmds ["ls"]               :fn ls-handler}
    {:cmds ["stop"]             :fn stop-handler
     :spec {:name {:alias :n :desc "Session name"}}}
