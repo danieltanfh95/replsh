@@ -1,12 +1,13 @@
 ---
 name: replsh
 description: >
-  REPL-driven development tool. Use replsh proactively during investigation,
-  planning, and debugging — eval expressions to verify assumptions, inspect
-  runtime state, and test hypotheses before writing code. Supports Clojure
-  (deps.edn, Leiningen, Babashka), Python (Poetry, venv), and Node.js.
-  Activate when working on any project with a .replsh/config.edn, or any
-  Clojure/Python/Node project where a REPL would help you understand the code.
+  A thinking medium for LLM agents. Use the REPL to verify assumptions, inspect
+  runtime state, and test hypotheses — think before you write. Timeouts return
+  partial output (never lose work). Streaming and background eval handle any
+  timescale. Supports Clojure (deps.edn, Leiningen, Babashka), Python (Poetry,
+  venv), and Node.js. Activate when working on any project with a
+  .replsh/config.edn, or any Clojure/Python/Node project where a REPL would
+  help you understand the code.
 license: EPL-2.0
 compatibility: Requires Babashka (bb) installed. REPL servers started by replsh or running externally.
 metadata:
@@ -16,7 +17,7 @@ metadata:
 
 # replsh
 
-A REPL gives you instant feedback. Use it to think, not just to execute.
+Bash runs commands. A REPL is where you think. Use it to verify before you write, not just to execute after. Timeouts return partial output, streaming gives real-time feedback, and background eval handles anything long-running — so the REPL works at every timescale.
 
 ## When to Use the REPL
 
@@ -165,34 +166,121 @@ replsh stop dev              # kill and remove
 replsh interrupt --name dev  # cancel running eval
 ```
 
+## Eval Modes
+
+replsh eval has three modes. Choose based on the task:
+
+### Default (sync with partial output)
+
+```bash
+replsh eval --name dev '(+ 1 2)'
+replsh eval --name dev '(long-running-fn)' --timeout 60000
+```
+
+If the eval completes within `--timeout` (default 30s), you get the full result. If it times out, you get **partial output** — whatever stdout/values accumulated before the deadline — as a success with `"partial": true`. The eval may still be running server-side. This means you never lose output to a timeout.
+
+Use `--timeout 0` to wait indefinitely (until completion or hard timeout).
+
+### Streaming (`--stream`)
+
+```bash
+replsh eval --name dev --stream '(doseq [i (range 10)] (println i) (Thread/sleep 500))'
+```
+
+Output arrives as NDJSON — one JSON line per chunk, streamed in real time. Final line has `"final": true`. Use this when you want to see output as it's produced (test suites, data processing, iterative output).
+
+### Background (`--bg`)
+
+```bash
+replsh eval --name dev --bg '(train-model data)'
+# → {"ok":true,"command":"eval-bg","data":{"eval-id":"eval-a1b2c3d4","session":"dev","pid":12345}}
+
+# Check status
+replsh evals
+
+# Read output later
+replsh output --eval-id eval-a1b2c3d4
+
+# Or tail output in real time
+replsh output --eval-id eval-a1b2c3d4 --follow
+```
+
+The eval runs in a background process. You get an eval-id immediately and can retrieve output later. Use this for long-running work (training, migrations, servers) where you don't want to block.
+
+### Hard timeout (`--hard-timeout`)
+
+```bash
+# Soft timeout at 5s (return partial), hard kill at 60s
+replsh eval --name dev '(expensive-fn)' --timeout 5000 --hard-timeout 60000
+
+# No soft timeout, hard kill at 5 minutes
+replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
+```
+
+`--hard-timeout` interrupts the eval server-side (nREPL interrupt, Jupyter interrupt). Returns exit code 3. Use when you need to guarantee the eval stops.
+
 ## Command Reference
 
 ```bash
+# Session lifecycle
 replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>]
 replsh start  [backend] --name <n> [--port <p>]
-replsh eval   --name <n> '<code>' | --file <path> | stdin  [--timeout <ms>]
 replsh ls
 replsh status --name <n>
 replsh stop   <n>
 replsh restart <n>
 replsh interrupt --name <n>
+
+# Eval
+replsh eval --name <n> '<code>' | --file <path> | stdin
+    [--timeout <ms>]           # soft timeout, default 30s (0 = no limit)
+    [--hard-timeout <ms>]      # interrupt eval after this
+    [--stream]                 # NDJSON output
+    [--bg]                     # background eval
+
+# Background eval management
+replsh evals                           # list all background evals
+replsh output --eval-id <id>           # read bg eval output
+replsh output --eval-id <id> --follow  # tail bg eval output
+
+# Process logs
+replsh logs --name <n>                 # full server log
+replsh logs --name <n> --tail 20       # last 20 lines
+replsh logs --name <n> --follow        # tail until process exits
 ```
 
 Backends: `nrepl`, `jupyter`, `node`. Optional when using project config.
 
 ## Output Format
 
-All commands emit one JSON object on stdout:
+### Sync eval (default)
+
+One JSON object on stdout:
 
 ```json
 {"ok": true, "command": "eval", "data": {"value": "3", "ns": "user", "chunks": [...]}}
+{"ok": true, "command": "eval", "data": {"chunks": [...]}, "partial": true}
 {"ok": false, "command": "eval", "error": {"code": "eval_error", "message": "..."}}
 ```
+
+### Streaming eval (`--stream`)
+
+NDJSON — one JSON line per chunk, final line is the summary:
+
+```
+{"type":"out","content":"hello\n","stream":"stdout","meta":{}}
+{"type":"value","content":"3","meta":{"ns":"user"}}
+{"ok":true,"command":"eval","data":{...},"final":true}
+```
+
+### Key fields
 
 - `data.value` — return value (string)
 - `data.ns` — current namespace (nREPL)
 - `data.chunks` — all output: `out`, `err`, `value`, `error`, `status`
-- Exit codes: 0=success, 1=eval error, 2=client error, 3=timeout
+- `partial` — true when eval timed out but returned partial output
+- `final` — true on the last line of streaming output
+- Exit codes: 0=success, 1=eval error, 2=client error, 3=hard timeout
 
 ## Config
 
@@ -223,6 +311,10 @@ Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
 
 - Port is auto-allocated if not specified — just omit `--port`
 - Use `--init` to require namespaces on session start
-- Use `--timeout` for long-running evals (default 30s)
 - Sessions persist across invocations — no need to re-launch
 - The REPL is your thinking tool. Use it early and often.
+- Timeout is graceful — you always get partial output, never a bare error
+- Use `--stream` for test suites and any eval where you want progressive output
+- Use `--bg` for anything that might run longer than you want to wait
+- Use `replsh logs` to inspect server-side output (startup messages, crash logs)
+- `--timeout 0` disables the soft timeout — use with `--hard-timeout` for a single deadline

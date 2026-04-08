@@ -6,7 +6,12 @@
             [replsh.process :as process]
             [replsh.state :as state]
             [replsh.output :as output]
-            [replsh.util :as util]))
+            [replsh.util :as util]
+            [cheshire.core :as json]
+            [clojure.edn :as edn]
+            [clojure.string :as str])
+  (:import [java.io File]
+           [java.lang ProcessBuilder$Redirect]))
 
 (defn- run-init!
   "Execute init code on a live connection. Throws on error."
@@ -130,40 +135,65 @@
 
 (defn eval-cmd
   "Evaluate code in a named session."
-  [{:keys [name code timeout]}]
+  [{:keys [name code timeout hard-timeout stream?]}]
   (let [state      (state/load-state)
         session    (state/get-session state name)]
     (when-not session
       (throw (ex-info (str "Session not found: " (or name "(no active session)"))
                       {:code :session-not-found})))
-    (let [live-state (backend/open! session)
+    (let [;; Compute effective backend timeout as min(soft, hard)
+          ;; --timeout 0 means "no soft timeout" (wait forever unless hard timeout set)
+          soft-ms    (let [t (or timeout 30000)] (if (zero? t) Long/MAX_VALUE t))
+          hard-ms    (if (and hard-timeout (pos? hard-timeout)) hard-timeout Long/MAX_VALUE)
+          effective-timeout (min soft-ms hard-ms)
+          hard-deadline (when (and hard-timeout (pos? hard-timeout))
+                          (+ (System/currentTimeMillis) hard-timeout))
+          live-state (backend/open! session)
           msg-id     (util/gen-id "eval")
+          on-chunk   (when stream? output/emit-chunk!)
           request    {:code       code
                       :name       (:name session)
                       :backend    (:backend session)
-                      :timeout-ms (or timeout 30000)
-                      :msg-id     msg-id}
+                      :timeout-ms effective-timeout
+                      :msg-id     msg-id
+                      :on-chunk   on-chunk}
           chunks     (backend/eval! request live-state)
-          ;; Update internal state (e.g., nREPL ns may have changed)
-          new-session (assoc session :internal (:internal live-state))]
-      (backend/close! live-state)
-      (state/put-session! state new-session)
-      (let [value-chunk (last (filter #(= :value (:type %)) chunks))
-            has-error?  (some #(= :error (:type %)) chunks)]
-        (if has-error?
-          (let [err-chunk (first (filter #(= :error (:type %)) chunks))]
-            (output/failure :eval {:code    "eval_error"
-                                   :message (:content err-chunk)
-                                   :detail  (:meta err-chunk)
-                                   :data    {:name   (:name session)
-                                             :chunks (mapv #(select-keys % [:type :content :stream :meta])
-                                                           chunks)}}))
-          (output/success :eval
-                          (cond-> {:name   (:name session)
-                                   :chunks (mapv #(select-keys % [:type :content :stream :meta])
-                                                 chunks)}
-                            value-chunk (assoc :value (:content value-chunk))
-                            (get-in value-chunk [:meta :ns]) (assoc :ns (get-in value-chunk [:meta :ns])))))))))
+          timed-out? (:timed-out? (meta chunks))
+          ;; Hard timeout: if soft timed out and hard deadline passed, interrupt
+          hard-expired? (and timed-out? hard-deadline
+                             (>= (System/currentTimeMillis) hard-deadline))]
+      (when hard-expired?
+        (try (backend/interrupt! live-state) (catch Exception _)))
+      ;; Update internal state (e.g., nREPL ns may have changed)
+      (let [new-session (assoc session :internal (:internal live-state))]
+        (backend/close! live-state)
+        (state/put-session! state new-session)
+        (let [clean-chunks (mapv #(select-keys % [:type :content :stream :meta]) chunks)]
+          (if hard-expired?
+            ;; Hard timeout — return as error (exit code 3)
+            (cond-> (output/failure :eval {:code    "timeout"
+                                           :message "Hard timeout: eval interrupted"
+                                           :data    {:name   (:name session)
+                                                     :chunks clean-chunks}})
+              stream? (assoc :stream? true))
+            ;; Normal or soft timeout
+            (let [value-chunk (last (filter #(= :value (:type %)) chunks))
+                  has-error?  (some #(= :error (:type %)) chunks)
+                  result (if has-error?
+                           (let [err-chunk (first (filter #(= :error (:type %)) chunks))]
+                             (output/failure :eval {:code    "eval_error"
+                                                    :message (:content err-chunk)
+                                                    :detail  (:meta err-chunk)
+                                                    :data    {:name   (:name session)
+                                                              :chunks clean-chunks}}))
+                           (output/success :eval
+                                           (cond-> {:name   (:name session)
+                                                    :chunks clean-chunks}
+                                             value-chunk (assoc :value (:content value-chunk))
+                                             (get-in value-chunk [:meta :ns]) (assoc :ns (get-in value-chunk [:meta :ns])))))]
+              (cond-> result
+                timed-out? (assoc :partial true)
+                stream?    (assoc :stream? true)))))))))
 
 (defn ls-cmd
   "List all sessions."
@@ -284,3 +314,175 @@
       (if (= :ok result)
         (output/success :interrupt {:name (:name session)})
         (output/failure :interrupt result)))))
+
+;; --- Background eval ---
+
+(def ^:private evals-dir
+  (str (System/getProperty "user.home") "/.replsh/evals/"))
+
+(defn- ensure-evals-dir! []
+  (.mkdirs (File. evals-dir)))
+
+(defn eval-bg-cmd
+  "Fork a background eval child process. Returns immediately with eval-id."
+  [{:keys [name code timeout hard-timeout]}]
+  (ensure-evals-dir!)
+  (let [eval-id    (util/gen-id "eval")
+        code-file  (str evals-dir eval-id ".code")
+        jsonl-file (str evals-dir eval-id ".jsonl")
+        meta-file  (str evals-dir eval-id ".meta.edn")
+        _          (spit code-file code)
+        meta-data  {:eval-id    eval-id
+                    :session    name
+                    :status     :running
+                    :started-at (util/timestamp)}
+        _          (spit meta-file (pr-str meta-data))
+        cmd-args   (cond-> ["bb" "-m" "replsh.main"
+                            "eval" "--name" name
+                            "--stream"
+                            "--file" code-file
+                            "--bg-child" eval-id]
+                     (and timeout (pos? timeout))
+                     (into ["--timeout" (str timeout)])
+                     (and hard-timeout (pos? hard-timeout))
+                     (into ["--hard-timeout" (str hard-timeout)]))
+        pb         (doto (ProcessBuilder. ^java.util.List cmd-args)
+                     (.redirectOutput (ProcessBuilder$Redirect/to (File. jsonl-file)))
+                     (.redirectErrorStream true)
+                     (.directory (File. (System/getProperty "user.dir"))))
+        process    (.start pb)
+        pid        (.pid process)]
+    ;; Update meta with PID
+    (spit meta-file (pr-str (assoc meta-data :pid pid)))
+    (output/success :eval-bg {:eval-id eval-id
+                               :session name
+                               :pid     pid})))
+
+(defn finalize-bg-eval!
+  "Update meta file after a background eval child completes."
+  [eval-id result]
+  (let [meta-file (str evals-dir eval-id ".meta.edn")]
+    (try
+      (let [current-meta (edn/read-string (slurp meta-file))
+            status       (cond
+                           (:ok result)                                 :completed
+                           (= "timeout" (get-in result [:error :code])) :timeout
+                           :else                                        :failed)]
+        (spit meta-file (pr-str (assoc current-meta
+                                       :status   status
+                                       :ended-at (util/timestamp)))))
+      (catch Exception _))))
+
+(defn output-cmd
+  "Read output from a background eval."
+  [{:keys [eval-id follow]}]
+  (let [meta-file  (str evals-dir eval-id ".meta.edn")
+        jsonl-file (str evals-dir eval-id ".jsonl")]
+    (when-not (.exists (File. meta-file))
+      (throw (ex-info (str "Eval not found: " eval-id)
+                      {:code :eval-not-found})))
+    (if follow
+      ;; Follow mode: tail jsonl, emit chunks until done
+      (loop [emitted 0]
+        (let [fresh-meta (edn/read-string (slurp meta-file))
+              lines      (when (.exists (File. jsonl-file))
+                           (remove str/blank? (str/split-lines (slurp jsonl-file))))
+              new-lines  (drop emitted lines)
+              parsed     (mapv #(json/parse-string % true) new-lines)
+              final-line (first (filter :final parsed))
+              chunks     (vec (remove :final parsed))]
+          (doseq [c chunks] (output/emit-chunk! c))
+          (if final-line
+            ;; Child wrote its summary — re-emit it as our result
+            (assoc (dissoc final-line :final) :stream? true)
+            (if (#{:completed :failed :timeout} (:status fresh-meta))
+              ;; Meta says done but no final line — child crashed
+              (cond-> (output/success :output {:eval-id eval-id
+                                                :status  (clojure.core/name (:status fresh-meta))
+                                                :session (:session fresh-meta)})
+                true (assoc :stream? true))
+              ;; Still running — wait and poll
+              (do
+                (Thread/sleep 200)
+                (recur (+ emitted (count chunks))))))))
+      ;; Non-follow: dump all at once
+      (let [meta-data (edn/read-string (slurp meta-file))
+            lines     (when (.exists (File. jsonl-file))
+                        (remove str/blank? (str/split-lines (slurp jsonl-file))))
+            parsed    (mapv #(json/parse-string % true) lines)
+            final-line (first (filter :final parsed))
+            chunks    (vec (remove :final parsed))]
+        (output/success :output (cond-> {:eval-id    eval-id
+                                          :status     (clojure.core/name (:status meta-data))
+                                          :session    (:session meta-data)
+                                          :started-at (:started-at meta-data)
+                                          :ended-at   (:ended-at meta-data)
+                                          :chunks     chunks}
+                                  final-line (assoc :summary (dissoc final-line :final))))))))
+
+(defn evals-cmd
+  "List all background evals."
+  []
+  (ensure-evals-dir!)
+  (let [files (->> (.listFiles (File. evals-dir))
+                   (filter #(str/ends-with? (.getName %) ".meta.edn"))
+                   (sort-by #(.lastModified %) >))
+        evals (mapv (fn [f]
+                      (try
+                        (let [m (edn/read-string (slurp f))]
+                          (cond-> {:eval-id    (:eval-id m)
+                                   :session    (:session m)
+                                   :status     (clojure.core/name (:status m))
+                                   :started-at (:started-at m)}
+                            (:ended-at m) (assoc :ended-at (:ended-at m))
+                            (:pid m)      (assoc :pid (:pid m))))
+                        (catch Exception _
+                          {:eval-id (.getName f) :status "corrupt"})))
+                    files)]
+    (output/success :evals {:evals evals})))
+
+;; --- Logs ---
+
+(def ^:private logs-dir
+  (str (System/getProperty "user.home") "/.replsh/logs/"))
+
+(defn logs-cmd
+  "Read process logs for a session."
+  [{:keys [name tail follow]}]
+  (let [state   (state/load-state)
+        session (state/get-session state name)
+        sname   (or name (:active state))
+        _       (when-not sname
+                  (throw (ex-info "No session name provided and no active session"
+                                  {:code :missing-arg})))
+        log-file (str logs-dir sname ".log")]
+    (when-not (.exists (File. log-file))
+      (throw (ex-info (str "No log file for session: " sname)
+                      {:code :log-not-found})))
+    (if follow
+      ;; Follow mode: tail log, emit lines as chunks
+      (let [pid (when session (get-in session [:launch :pid]))]
+        (loop [offset 0]
+          (let [content  (slurp log-file)
+                new-part (subs content (min offset (count content)))
+                lines    (when (pos? (count new-part))
+                           (str/split-lines new-part))]
+            (doseq [line lines]
+              (output/emit-chunk! {:type :out :content (str line "\n")
+                                   :stream :stdout :meta {}}))
+            (let [new-offset (count content)]
+              ;; If process is dead and no new data, we're done
+              (if (and (= new-offset offset)
+                       (or (nil? pid) (not (process/alive? pid))))
+                (cond-> (output/success :logs {:name sname :lines (count (str/split-lines content))})
+                  true (assoc :stream? true))
+                (do
+                  (Thread/sleep 200)
+                  (recur new-offset)))))))
+      ;; Non-follow: dump lines
+      (let [content (slurp log-file)
+            lines   (str/split-lines content)
+            lines   (if tail (vec (take-last tail lines)) (vec lines))]
+        (output/success :logs {:name  sname
+                                :lines (count lines)
+                                :content (str/join "\n" lines)})))))

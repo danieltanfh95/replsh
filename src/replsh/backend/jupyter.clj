@@ -49,15 +49,19 @@
 
 (defn- collect-responses
   "Read WebSocket messages until we get an execute_reply for our msg-id.
-   Returns vector of response chunks."
-  [ws-conn msg-id session-name timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) timeout-ms)
+   Returns vector of response chunks.
+   When on-chunk is provided, calls it per chunk for streaming."
+  [ws-conn msg-id session-name timeout-ms on-chunk]
+  (let [deadline (if (pos? timeout-ms)
+                   (+ (System/currentTimeMillis) timeout-ms)
+                   Long/MAX_VALUE)
         chunks   (atom [])]
     (loop []
       (let [remaining (- deadline (System/currentTimeMillis))]
         (when (<= remaining 0)
           (throw (ex-info "Timeout waiting for Jupyter response"
-                          {:code :timeout :msg-id msg-id})))
+                          {:code :timeout :msg-id msg-id
+                           :chunks @chunks})))
         (let [msg (ws/recv-json ws-conn (min remaining 1000))]
           (if-not msg
             (recur)
@@ -65,44 +69,44 @@
                   msg-type      (get-in msg [:header :msg_type])]
               ;; Only process messages for our request
               (when (= parent-msg-id msg-id)
-                (case msg-type
-                  "stream"
-                  (let [stream-name (get-in msg [:content :name])
-                        text        (get-in msg [:content :text])]
-                    (swap! chunks conj
-                           {:type    (if (= "stderr" stream-name) :err :out)
-                            :content text
-                            :stream  (keyword stream-name)
-                            :meta    {}
-                            :done?   false
-                            :msg-id  msg-id
-                            :name    session-name}))
+                (let [chunk (case msg-type
+                              "stream"
+                              (let [stream-name (get-in msg [:content :name])
+                                    text        (get-in msg [:content :text])]
+                                {:type    (if (= "stderr" stream-name) :err :out)
+                                 :content text
+                                 :stream  (keyword stream-name)
+                                 :meta    {}
+                                 :done?   false
+                                 :msg-id  msg-id
+                                 :name    session-name})
 
-                  "execute_result"
-                  (let [data (get-in msg [:content :data :text/plain])]
-                    (swap! chunks conj
-                           {:type    :value
-                            :content (or data "")
-                            :meta    {:execution_count (get-in msg [:content :execution_count])}
-                            :done?   false
-                            :msg-id  msg-id
-                            :name    session-name}))
+                              "execute_result"
+                              (let [data (get-in msg [:content :data :text/plain])]
+                                {:type    :value
+                                 :content (or data "")
+                                 :meta    {:execution_count (get-in msg [:content :execution_count])}
+                                 :done?   false
+                                 :msg-id  msg-id
+                                 :name    session-name})
 
-                  "error"
-                  (let [ename  (get-in msg [:content :ename])
-                        evalue (get-in msg [:content :evalue])
-                        tb     (get-in msg [:content :traceback])]
-                    (swap! chunks conj
-                           {:type    :error
-                            :content (str ename ": " evalue)
-                            :meta    {:ename ename :evalue evalue
-                                      :traceback (vec tb)}
-                            :done?   false
-                            :msg-id  msg-id
-                            :name    session-name}))
+                              "error"
+                              (let [ename  (get-in msg [:content :ename])
+                                    evalue (get-in msg [:content :evalue])
+                                    tb     (get-in msg [:content :traceback])]
+                                {:type    :error
+                                 :content (str ename ": " evalue)
+                                 :meta    {:ename ename :evalue evalue
+                                           :traceback (vec tb)}
+                                 :done?   false
+                                 :msg-id  msg-id
+                                 :name    session-name})
 
-                  ;; Ignore other message types
-                  nil))
+                              ;; Ignore other message types
+                              nil)]
+                  (when chunk
+                    (swap! chunks conj chunk)
+                    (when on-chunk (on-chunk chunk)))))
               ;; Check if we got execute_reply
               (if (and (= parent-msg-id msg-id)
                        (= msg-type "execute_reply"))
@@ -164,12 +168,23 @@
 
 (defmethod backend/eval! :jupyter
   [request live-state]
-  (let [{:keys [code name timeout-ms msg-id]} request
+  (let [{:keys [code name timeout-ms msg-id on-chunk]} request
         ws-conn   (get-in live-state [:handles :ws])
         session-id (util/gen-id "sess")
         exec-msg  (make-execute-request code session-id msg-id)]
     (ws/send-json ws-conn exec-msg)
-    (collect-responses ws-conn msg-id name (or timeout-ms 30000))))
+    (try
+      (collect-responses ws-conn msg-id name (or timeout-ms 30000) on-chunk)
+      (catch clojure.lang.ExceptionInfo e
+        (if (= :timeout (:code (ex-data e)))
+          (let [partial-chunks (or (:chunks (ex-data e)) [])
+                chunks (if (seq partial-chunks)
+                         (update partial-chunks (dec (count partial-chunks))
+                                 assoc :done? true)
+                         [{:type :status :content "" :meta {} :done? true
+                           :msg-id msg-id :name name}])]
+            (with-meta chunks {:timed-out? true}))
+          (throw e))))))
 
 (defmethod backend/interrupt! :jupyter
   [live-state]

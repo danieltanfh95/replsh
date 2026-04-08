@@ -27,16 +27,23 @@ bb -m replsh.main eval --name dev --file src/replsh/util.clj
 
 # From stdin (pipe)
 echo '(require (quote [replsh.util :as util])) (util/find-free-port)' | bb -m replsh.main eval --name dev
+
+# Stream output (test suites, long-running)
+bb -m replsh.main eval --name dev --stream '(run-tests)'
+
+# Background eval (returns immediately)
+bb -m replsh.main eval --name dev --bg '(long-task)'
+bb -m replsh.main output --eval-id <id>
 ```
 
 **Run tests through the REPL** (faster than cold-starting bb each time):
 
 ```bash
-# Unit tests only
-bb -m replsh.main eval --name dev '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :unit-only? true)' --timeout 60000
+# Unit tests only (streaming shows progress)
+bb -m replsh.main eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :unit-only? true)' --timeout 60000
 
 # All tests (unit + integration)
-bb -m replsh.main eval --name dev '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all)' --timeout 120000
+bb -m replsh.main eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all)' --timeout 120000
 ```
 
 **Or run tests directly** (cold start, simpler):
@@ -53,4 +60,6 @@ bb -m replsh.main ls                    # list sessions
 bb -m replsh.main status --name dev     # check reachability
 bb -m replsh.main restart dev           # restart server + re-run init
 bb -m replsh.main stop dev              # kill server, remove session
+bb -m replsh.main logs --name dev       # read server process logs
+bb -m replsh.main evals                 # list background evals
 ```

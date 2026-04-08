@@ -131,9 +131,28 @@
                                  (throw (ex-info "No code provided (pass as argument, --file, or pipe to stdin)"
                                                  {:code :missing-arg})))
                                input))]
-    (cmd/eval-cmd {:name    (:name opts)
-                   :code    code
-                   :timeout (:timeout opts)})))
+    (cond
+      (:bg opts)
+      (cmd/eval-bg-cmd {:name         (:name opts)
+                         :code         code
+                         :timeout      (:timeout opts)
+                         :hard-timeout (:hard-timeout opts)})
+
+      (:bg-child opts)
+      (let [result (cmd/eval-cmd {:name         (:name opts)
+                                   :code         code
+                                   :timeout      (:timeout opts)
+                                   :hard-timeout (:hard-timeout opts)
+                                   :stream?      true})]
+        (cmd/finalize-bg-eval! (:bg-child opts) result)
+        result)
+
+      :else
+      (cmd/eval-cmd {:name         (:name opts)
+                     :code         code
+                     :timeout      (:timeout opts)
+                     :hard-timeout (:hard-timeout opts)
+                     :stream?      (:stream opts)}))))
 
 (defn- ls-handler [_] (cmd/ls-cmd))
 
@@ -154,6 +173,19 @@
 (defn- interrupt-handler
   [{:keys [opts]}]
   (cmd/interrupt-cmd {:name (:name opts)}))
+
+(defn- output-handler
+  [{:keys [opts]}]
+  (cmd/output-cmd {:eval-id (:eval-id opts)
+                    :follow  (:follow opts)}))
+
+(defn- evals-handler [_] (cmd/evals-cmd))
+
+(defn- logs-handler
+  [{:keys [opts]}]
+  (cmd/logs-cmd {:name   (:name opts)
+                  :tail   (:tail opts)
+                  :follow (:follow opts)}))
 
 (def ^:private base-spec
   {:name      {:alias :n :desc "Session name"}
@@ -195,9 +227,13 @@
 
    ;; Other commands
    {:cmds ["eval"]             :fn eval-handler
-    :spec {:name    {:alias :n :desc "Session name"}
-           :timeout {:alias :t :desc "Timeout in ms" :coerce :long :default 30000}
-           :file    {:alias :f :desc "Read code from file (use /dev/stdin for stdin)" :coerce :string}}}
+    :spec {:name         {:alias :n :desc "Session name"}
+           :timeout      {:alias :t :desc "Soft timeout in ms (returns partial output)" :coerce :long :default 30000}
+           :hard-timeout {:desc "Hard timeout in ms (interrupts eval)" :coerce :long}
+           :stream       {:alias :s :desc "Stream output as NDJSON" :coerce :boolean :default false}
+           :bg           {:desc "Run eval in background, return eval-id" :coerce :boolean :default false}
+           :bg-child     {:desc "Internal: background child mode" :coerce :string}
+           :file         {:alias :f :desc "Read code from file (use /dev/stdin for stdin)" :coerce :string}}}
    {:cmds ["ls"]               :fn ls-handler}
    {:cmds ["stop"]             :fn stop-handler
     :spec {:name {:alias :n :desc "Session name"}}}
@@ -206,7 +242,15 @@
    {:cmds ["status"]           :fn status-handler
     :spec {:name {:alias :n :desc "Session name"}}}
    {:cmds ["interrupt"]        :fn interrupt-handler
-    :spec {:name {:alias :n :desc "Session name"}}}])
+    :spec {:name {:alias :n :desc "Session name"}}}
+   {:cmds ["output"]           :fn output-handler
+    :spec {:eval-id {:alias :e :desc "Background eval ID" :coerce :string :require true}
+           :follow  {:alias :f :desc "Tail output until eval completes" :coerce :boolean :default false}}}
+   {:cmds ["evals"]            :fn evals-handler}
+   {:cmds ["logs"]             :fn logs-handler
+    :spec {:name   {:alias :n :desc "Session name"}
+           :tail   {:alias :t :desc "Show last N lines" :coerce :long}
+           :follow {:alias :f :desc "Tail log until process exits" :coerce :boolean :default false}}}])
 
 (def ^:private help-text
   "replsh — Unified CLI for REPL servers
@@ -223,6 +267,9 @@ Commands:
   stop   <name>                    Stop and remove a session
   restart <name>                   Restart a session
   interrupt --name <name>          Interrupt a running eval
+  evals                            List background evals
+  output --eval-id <id>            Read background eval output
+  logs   --name <name>             Read process logs
 
 Backends: nrepl, jupyter, node
 
@@ -235,6 +282,9 @@ Eval examples:
   replsh eval --name dev '(+ 1 2)'          # inline code
   replsh eval --name dev --file script.clj  # from file
   echo '(+ 1 2)' | replsh eval --name dev  # from stdin
+  replsh eval --name dev --bg '(train-model)' # background eval
+  replsh output --eval-id <id>              # read bg output
+  replsh output --eval-id <id> --follow     # tail bg output
 
 Start examples (connect to existing server):
   replsh start nrepl --name dev --port 1667

@@ -24,3 +24,21 @@
       "eval_error" 1
       "timeout"    3
       2)))
+
+(defn emit-chunk!
+  "Print a single chunk as a JSON line to stdout (NDJSON). Flushes immediately."
+  [chunk]
+  (println (json/generate-string (select-keys chunk [:type :content :stream :meta])))
+  (flush))
+
+(defn emit-summary!
+  "Print the final summary envelope as the last NDJSON line. Returns exit code."
+  [result]
+  (println (json/generate-string (assoc result :final true)))
+  (flush)
+  (if (:ok result)
+    0
+    (case (get-in result [:error :code])
+      "eval_error" 1
+      "timeout"    3
+      2)))

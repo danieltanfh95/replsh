@@ -19,12 +19,15 @@
    AND there's been a period of no new data (the prompt is the last thing sent).
    Returns the collected output (everything before the final prompt)."
   [^BufferedReader in prompt-str timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) timeout-ms)
+  (let [deadline (if (pos? timeout-ms)
+                   (+ (System/currentTimeMillis) timeout-ms)
+                   Long/MAX_VALUE)
         sb       (StringBuilder.)]
     (loop []
       (when (> (System/currentTimeMillis) deadline)
         (throw (ex-info "Timeout waiting for Node REPL prompt"
-                        {:code :timeout})))
+                        {:code :timeout
+                         :partial-output (.toString sb)})))
       (if (.ready in)
         (let [ch (.read in)]
           (when (neg? ch)
@@ -119,15 +122,25 @@
 
 (defmethod backend/eval! :node
   [request live-state]
-  (let [{:keys [code name timeout-ms msg-id]} request
+  (let [{:keys [code name timeout-ms msg-id on-chunk]} request
         {:keys [in out]} (:handles live-state)
         prompt-str (get-in live-state [:config :backend-opts :prompt-re] "> ")]
     ;; Send code
     (.println ^PrintWriter out code)
     (.flush ^PrintWriter out)
     ;; Read output until prompt
-    (let [raw-output (read-until-prompt in prompt-str (or timeout-ms 30000))]
-      (parse-output raw-output name msg-id))))
+    (try
+      (let [raw-output (read-until-prompt in prompt-str (or timeout-ms 30000))]
+        (let [chunks (parse-output raw-output name msg-id)]
+          (when on-chunk (doseq [c chunks] (on-chunk c)))
+          chunks))
+      (catch clojure.lang.ExceptionInfo e
+        (if (= :timeout (:code (ex-data e)))
+          (let [raw    (or (:partial-output (ex-data e)) "")
+                chunks (parse-output raw name msg-id)]
+            (when on-chunk (doseq [c chunks] (on-chunk c)))
+            (with-meta chunks {:timed-out? true}))
+          (throw e))))))
 
 (defmethod backend/interrupt! :node
   [_live-state]

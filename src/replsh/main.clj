@@ -7,7 +7,9 @@
   (try
     (let [result (cli/dispatch args)]
       (when (map? result)
-        (let [exit-code (output/emit! result)]
+        (let [exit-code (if (:stream? result)
+                          (output/emit-summary! (dissoc result :stream?))
+                          (output/emit! result))]
           (System/exit exit-code))))
     (catch clojure.lang.ExceptionInfo e
       (let [data    (ex-data e)

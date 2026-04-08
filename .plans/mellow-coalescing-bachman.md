@@ -1,357 +1,203 @@
-# `replsh launch` — Process Lifecycle, Toolchains, Config + `--init`
+# Async eval: soft/hard timeouts, streaming, background
 
 ## Context
 
-replsh currently only connects to *existing* REPL servers. For Poetry/venv workflows, this means the user must manually start servers inside the right environment. The `launch` command automates this: spawn a server process → wait for readiness → connect.
+Every `replsh eval` blocks until completion or timeout. Timeout is an error — all captured output is thrown away. This means:
+- Starting a server via eval? 30s wait, then error, output lost.
+- Running a training loop? Same — wait, error, nothing.
+- Quick 100ms eval? Works fine, but the timeout behavior punishes everything else.
 
-Two independent dimensions:
-- **Protocol** (how to talk): nREPL, Jupyter, Node — the `:backend`
-- **Toolchain** (how to start): lein, deps.edn, bb, poetry, pipenv — the `:cmd`
-
-Also adds `--init` for post-connect bootstrap code (useful for both `launch` and `start`).
-
----
-
-## Data Structure Shapes
-
-Four distinct shapes at different layers:
-
-### 1. Toolchain Preset — global, reusable across projects
-
-Defines backend protocol + cmd template with `{placeholder}` substitution.
-
-```clojure
-;; ~/.replsh/config.edn
-{:toolchains
- {"clojure.deps"   {:backend  :nrepl
-                    :cmd      "clj -M:nrepl -m nrepl.cmdline --port {port}"
-                    :defaults {:port 7888}}
-
-  "clojure.lein"   {:backend  :nrepl
-                    :cmd      "lein repl :headless :port {port}"
-                    :defaults {:port 7888}}
-
-  "clojure.bb"     {:backend  :nrepl
-                    :cmd      "bb --nrepl-server {port}"
-                    :defaults {:port 1667}}
-
-  "python.poetry"  {:backend  :jupyter
-                    :cmd      "poetry run jupyter server --port {port}"
-                    :defaults {:port 8888 :kernel "python3"}}
-
-  "python.venv"    {:backend  :jupyter
-                    :cmd      "{cwd}/.venv/bin/jupyter server --port {port}"
-                    :defaults {:port 8888 :kernel "python3"}}
-
-  "node"           {:backend  :node
-                    :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port})\""
-                    :defaults {:port 5001 :prompt-re "> "}}}}
-```
-
-Common toolchains ship built-in with replsh. Users extend/override in `~/.replsh/config.edn`.
-
-### 2. Session Spec — project-level, references toolchain
-
-Flat keys. References a toolchain by name. Any field overrides the toolchain.
-
-```clojure
-;; <project>/.replsh/config.edn
-{:sessions
- {"backend"  {:toolchain "clojure.deps"
-              :port      1667
-              :init      "(require '[my.app])"}
-
-  "ml"       {:toolchain "python.poetry"
-              :port      8888
-              :cwd       "ml/"
-              :kernel    "python3"}
-
-  "frontend" {:toolchain "node"
-              :port      5001
-              :cwd       "frontend/"}
-
-  ;; Override toolchain cmd for a specific session
-  "legacy"   {:toolchain "clojure.lein"
-              :port      4567
-              :cmd       "lein with-profile +dev repl :headless :port {port}"}}}
-```
-
-### 3. Resolved Spec — in-memory only (toolchain + session + CLI merged)
-
-Flat, absolute paths, all values resolved, template vars substituted. Input to `launch-cmd`/`start-cmd`.
-
-```clojure
-{:backend-type :nrepl
- :name         "backend"
- :host         "localhost"
- :port         1667
- :cmd          "clj -M:nrepl -m nrepl.cmdline --port 1667"  ;; {port} substituted
- :cwd          "/repo"
- :init         "(require '[my.app])"
- :env          {}
- :kernel       nil :token nil :prompt-re nil}
-```
-
-### 4. Session Config — machine-generated, persisted to `~/.replsh/state.edn`
-
-Structured internal representation. What backends consume. Self-contained.
-
-```clojure
-{:name         "backend"
- :backend      :nrepl
- :created-at   "2026-04-07T10:00:00Z"
- :transport    {:type :tcp :host "localhost" :port 1667}
- :env          {:cwd "/repo" :vars {}}
- :launch       {:cmd "clj -M:nrepl -m nrepl.cmdline --port 1667"
-                :cwd "/repo" :pid 12345}
- :init-code    "(require '[my.app])"
- :backend-opts {}
- :internal     {:session-id "nrepl-sess-uuid"}}
-```
+The core fix: **soft timeout returns partial output** (not an error). This changes the default experience without new flags. Streaming and background eval are additive power features.
 
 ---
 
-## Data Flow
+## Design: soft vs hard timeout
 
-```
-Built-in toolchain presets (hardcoded in replsh)
-         │
-         ▼  extended/overridden by
-~/.replsh/config.edn :toolchains (Toolchain Preset)
-         │
-         ▼  referenced by :toolchain key
-<project>/.replsh/config.edn :sessions (Session Spec)
-         │
-         ▼  overridden by
-CLI args (--port, --cmd, --init, etc.)
-         │
-         ▼
-┌─────────────────────────────────────────────────┐
-│  config/resolve-session  (Config layer)         │
-│  1. Lookup toolchain → get {:backend :cmd ...}  │
-│  2. Merge toolchain defaults                    │
-│  3. Merge session spec (overrides toolchain)    │
-│  4. Merge CLI args (overrides everything)       │
-│  5. Resolve relative :cwd to absolute           │
-│  6. Substitute {port}, {cwd} in :cmd template   │
-│  OUT: Resolved Spec                             │
-└──────────────────┬──────────────────────────────┘
-                   ▼
-┌─────────────────────────────────────────────────┐
-│  command/launch-cmd  (Orchestration)            │
-│  1. process/spawn! with resolved :cmd → PID     │
-│  2. process/wait-for-port!                      │
-│  3. Transform Resolved Spec → Session Config    │
-│     :host+:port → {:transport {:type :tcp ..}}  │
-│     :cwd+:env   → {:env {:cwd .. :vars ..}}    │
-│     :cmd+PID    → {:launch {:cmd .. :pid ..}}   │
-│     :init       → {:init-code "..."}            │
-│  4. backend/open! → :internal                   │
-│  5. run-init! (if init-code)                    │
-│  6. Persist Session Config to state.edn         │
-└──────────────────┬──────────────────────────────┘
-                   ▼
-┌─────────────────────────────────────────────────┐
-│  state.edn (Session Config)                     │
-│  Self-contained — eval/stop/restart/status      │
-│  never read config files                        │
-└─────────────────────────────────────────────────┘
-```
+**Soft timeout** (`--timeout`, existing flag, default 30s):
+- Read loop stops at deadline
+- Returns accumulated chunks as **partial success**: `{"ok": true, "partial": true, "data": {"chunks": [...]}}`
+- Exit code **0** (not 3)
+- Eval may still be running server-side — replsh just stops listening
+- The LLM gets useful output without any new flags
 
-**Key**: Config files are consulted only during `launch`/`start`. Once persisted, `state.edn` is the source of truth.
+**Hard timeout** (`--hard-timeout`, new flag, no default):
+- When reached, sends **interrupt** to backend (nREPL `interrupt` op, Jupyter REST `/interrupt`)
+- Returns accumulated chunks as **timeout error**: `{"ok": false, "error": {"code": "timeout"}, "data": {"chunks": [...]}}`
+- Exit code **3**
+- Actually kills the eval
 
-**Backends don't change at all** — they connect to a running server. Process management + config resolution are separate layers above.
-
----
-
-## Config Files
-
-### `~/.replsh/config.edn` (global)
-
-Toolchain presets. User-defined/overridden. Searched at fixed path (override with `REPLSH_CONFIG_GLOBAL`).
-
-### `<project>/.replsh/config.edn` (project)
-
-Session definitions. Searched from cwd walking up to filesystem root (like `.gitignore`). Override with `REPLSH_CONFIG` env var.
-
-### Resolution order
-
-```
-toolchain :defaults → toolchain top-level → session spec → CLI args
-```
-
-Any field specified at a later stage overrides the earlier one. Flat merge, no nesting.
-
----
-
-## CLI
+They compose:
 
 ```bash
-# Launch from project config (reads toolchain + session)
-replsh launch --name backend
+# Default: soft timeout at 30s — returns partial output
+replsh eval --name dev '(start-server)'
 
-# Launch with full CLI args (no config needed, backend as subcommand)
-replsh launch nrepl --name backend --port 1667 \
-  --cmd "bb --nrepl-server 1667" --cwd /repo
+# Sniff 5s of output, let eval continue
+replsh eval --name dev '(start-server)' --timeout 5000
 
-# Launch from config + CLI override
-replsh launch --name backend --cmd "clj -M:dev:nrepl -m nrepl.cmdline --port {port}"
+# Stream test output, hard-kill at 2 minutes
+replsh eval --name dev --stream '(run-tests)' --hard-timeout 120000
 
-# Start (connect-only, no process spawn)
-replsh start --name backend       # from config
-replsh start nrepl --name backend --port 1667  # from CLI
-
-# --init on both launch and start
-replsh launch --name backend --init "(require '[my.app :as app])"
-replsh start --name backend --init "(require '[my.app :as app])"
+# No soft timeout (wait for completion), hard-kill at 5 minutes
+replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 ```
 
-When using config: backend type comes from toolchain `:backend`. When using CLI only: backend type is the subcommand.
+`--timeout 0` = no soft timeout (wait until eval completes or hard timeout).
 
 ---
 
-## File Changes
+## Changes
 
-### 1. NEW: `src/replsh/process.clj`
+### Phase 1: Soft timeout (core change — no new flags needed)
 
-Process lifecycle. No knowledge of backends or config.
+The highest-impact, smallest change. Every eval immediately benefits.
 
-- **`spawn!`** `[{:keys [cmd cwd env-vars name]}] -> {:pid long :process Process}`
-  - `ProcessBuilder ["/bin/sh" "-c" cmd]`, set `.directory()`, merge env via `.environment()`
-  - Redirect stdout+stderr to `~/.replsh/logs/<name>.log`
-  - Check alive after 200ms — throws `:launch-failed` if dead
+**`src/replsh/backend/nrepl.clj`** — `read-responses` returns partial on timeout:
+- Currently: throws `(ex-info "..." {:code :timeout})` when deadline exceeded
+- Change: return accumulated chunks with a `:timed-out? true` metadata flag
+- The loop already accumulates chunks — just stop looping and return them
 
-- **`wait-for-port!`** `[{:keys [host port timeout-ms process]}] -> true | throws`
-  - Poll TCP connect every 250ms. Check `process.isAlive()` each iteration.
-  - Throws `:port-timeout` or `:launch-failed`
+**`src/replsh/backend/jupyter.clj`** — `collect-responses` same change:
+- Currently: throws on timeout
+- Change: return accumulated chunks with `:timed-out? true`
 
-- **`wait-for-http!`** `[{:keys [url timeout-ms process]}] -> true | throws`
-  - Same pattern, polls HTTP GET to `<url>/api/status`. For Jupyter.
+**`src/replsh/backend/node.clj`** — `read-until-prompt` same change:
+- Currently: throws on timeout  
+- Change: return whatever text was accumulated, parse to chunks, flag as timed-out
 
-- **`kill!`** `[pid] -> :killed | :already-dead`
-  - `ProcessHandle/of` → `.destroy()` (SIGTERM) → wait 3s → `.destroyForcibly()` (SIGKILL)
+**`src/replsh/command.clj`** — `eval-cmd` handles partial results:
+- Detect `:timed-out?` in the returned chunks metadata (or as a flag on the result)
+- Build result with `"partial": true` in the envelope
+- Exit code 0 (success), not 3 (timeout)
 
-- **`alive?`** `[pid] -> boolean`
+**`src/replsh/output.clj`** — Support `partial` field:
+- `success` fn accepts optional `partial?` parameter
+- Adds `"partial": true` to the JSON envelope when set
 
-### 2. NEW: `src/replsh/config.clj`
+**No CLI changes needed** — `--timeout` already exists and defaults to 30000.
 
-Config loading + resolution. The bridge between user-authored config and internal data.
+### Phase 2: Hard timeout + interrupt on deadline
 
-- **`builtin-toolchains`** — hardcoded map of common toolchains (clojure.deps, clojure.lein, clojure.bb, python.poetry, python.venv, node)
+**`src/replsh/cli.clj`** — Add `--hard-timeout` flag to eval spec:
+- `{:hard-timeout {:desc "Hard timeout: interrupt eval (ms)" :coerce :long}}`
 
-- **`load-global-config`** `[] -> map | nil`
-  - Read `~/.replsh/config.edn` (or `REPLSH_CONFIG_GLOBAL`)
+**`src/replsh/command.clj`** — `eval-cmd` implements hard timeout:
+- Pass both `:timeout-ms` and `:hard-timeout-ms` in request
+- If eval returns with `:timed-out?` and hard-timeout is set, check if hard deadline passed
+- If hard deadline passed: call `backend/interrupt!`, return timeout error (exit 3)
+- If hard deadline not yet passed: return partial success as in Phase 1
 
-- **`load-project-config`** `[] -> {:config map :dir path} | nil`
-  - Walk from cwd upward looking for `.replsh/config.edn` (or `REPLSH_CONFIG`)
-  - Returns both the config and the directory it was found in (for resolving relative paths)
+Alternative (simpler): handle hard timeout inside each backend's read loop:
+- The read loop checks two deadlines: soft and hard
+- On soft deadline: stop reading, return partial
+- On hard deadline: throw timeout (existing behavior)
 
-- **`resolve-toolchains`** `[global-config] -> merged-toolchains`
-  - `(merge builtin-toolchains (:toolchains global-config))`
+The simpler approach keeps the backend interface clean — backends already handle timeout, we just add a second tier.
 
-- **`resolve-session`** `[toolchains project-config session-name cli-opts] -> Resolved Spec`
-  1. Lookup session in project config: `(get-in project-config [:config :sessions session-name])`
-  2. Lookup toolchain: `(get toolchains (:toolchain session-spec))`
-  3. Merge: `toolchain :defaults` → toolchain top-level → session spec → CLI opts
-  4. Resolve relative `:cwd` against project config dir
-  5. Substitute `{port}`, `{cwd}`, `{host}` in `:cmd` string
-  6. Derive `:address` or `:url` from `:host` + `:port` if not explicitly set
+### Phase 3: Streaming eval (`--stream`)
 
-- **`substitute-template`** `[cmd-template resolved-map] -> cmd-string`
-  - Replace `{port}`, `{cwd}`, `{host}` etc. in the cmd string
+**`src/replsh/output.clj`** — Add NDJSON functions:
+- `emit-chunk!` — print one chunk as JSON line to stdout, flush immediately
+- `emit-summary!` — print final envelope with `"final": true`, return exit code
 
-### 3. MODIFY: `src/replsh/cli.clj`
+**`src/replsh/backend/nrepl.clj`** — `on-chunk` callback in `read-responses`:
+- Extract `response->chunks` (single nREPL response → seq of replsh chunks)
+- When `:on-chunk` is in request, call it per chunk as it arrives
+- Still accumulate and return chunks (for the summary line)
 
-- Add `launch-handler` — loads config, resolves session, delegates to `cmd/launch-cmd`
-  - `replsh launch --name X`: resolve from config (no subcommand needed)
-  - `replsh launch nrepl --name X ...`: use subcommand as backend, config provides defaults
-- Add dispatch entries: `["launch" "nrepl"]`, `["launch" "jupyter"]`, `["launch" "node"]`, `["launch"]` (config-only)
-- Add `--init`, `--port` to existing `start` and new `launch` specs
-- Modify `start-handler` to also resolve from config when `--name` matches a config entry
+**`src/replsh/backend/jupyter.clj`** — Same pattern:
+- `on-chunk` callback in `collect-responses`
 
-### 4. MODIFY: `src/replsh/command.clj`
+**`src/replsh/backend/node.clj`** — Line-buffered streaming:
+- Emit `:out` chunk per newline when `on-chunk` is set
+- Prompt detection still marks completion
 
-Add `(:require [replsh.process :as process] [clojure.string :as str])`.
+**`src/replsh/command.clj`** — Wire up:
+- When `stream?`, set `:on-chunk output/emit-chunk!` in request
+- Return result with `:stream? true` for main.clj
 
-**New `launch-cmd`**:
-1. `process/spawn!` with cmd, cwd, env-vars
-2. `process/wait-for-port!` or `wait-for-http!` (based on backend type)
-3. Build Session Config from Resolved Spec + `:launch {:cmd .. :pid ..}`
-4. `backend/open!` to verify connectivity
-5. `run-init!` if init-code provided
-6. `backend/close!`, persist session
-7. On ANY failure post-spawn: `process/kill!` to prevent orphans, re-throw
+**`src/replsh/cli.clj`** — Add `--stream` / `-s` flag to eval spec
 
-**New `run-init!`** helper (shared by `launch-cmd` and `start-cmd`):
-- Eval init code via `backend/eval!`, throws `:init-failed` on error
+**`src/replsh/main.clj`** — Branch on `:stream?`:
+- Streaming: `output/emit-summary!` (chunks already emitted inline)
+- Sync: `output/emit!` as before
 
-**Modified `start-cmd`**: Accept `:init`, call `run-init!` after open. On init failure: close, destroy, throw.
+### Phase 4: Background eval (`--bg`) + output reading
 
-**Modified `stop-cmd`**: If session has `:launch`, `process/kill!` before `backend/destroy!`.
+**File conventions:**
+- `~/.replsh/evals/<eval-id>.jsonl` — NDJSON chunks from child process
+- `~/.replsh/evals/<eval-id>.meta.edn` — `{:eval-id :session :pid :status :started-at :ended-at}`
+- `~/.replsh/evals/<eval-id>.code` — code temp file (avoids shell quoting)
 
-**Modified `restart-cmd`**: If session has `:launch`, kill → re-spawn → wait → re-connect. Else existing behavior.
+**`src/replsh/command.clj`** — `eval-bg-cmd`:
+1. Write code to `.code` temp file
+2. Write initial `.meta.edn` with `:status :running`
+3. Fork child: `bb -m replsh.main eval --name <n> --stream --bg-child <eval-id> --file <code-file>` with stdout → `.jsonl`
+4. Record PID, return immediately with eval-id
 
-**Modified `status-cmd`**: Show `{:launch {:pid N :alive bool :cmd "..."}}` when present.
+**`src/replsh/command.clj`** — Child mode (`--bg-child`):
+- Streaming eval, does NOT write to `state.edn`
+- On completion, writes final status to `.meta.edn`
 
-### 5. No changes needed
+**`src/replsh/command.clj`** — `output-cmd`:
+- `replsh output --eval-id <id>` — read `.meta.edn` + `.jsonl`
+- `--follow` — tail until done (checks PID liveness)
 
-- `src/replsh/backend.clj` and all backend implementations — unaware of process/config
-- `src/replsh/state.clj` — `:launch` and `:init-code` are just EDN fields
-- `src/replsh/main.clj` — error handling already generic
-- `bb.edn` — `ProcessBuilder`/`ProcessHandle` are JVM stdlib
+**`src/replsh/command.clj`** — `evals-cmd`:
+- `replsh evals` — list all bg evals
+
+**`src/replsh/cli.clj`** — New flags/commands:
+- `--bg` on eval, `output` command, `evals` command
+
+### Phase 5: Process log reading (`logs` command)
+
+**`src/replsh/command.clj`** — `logs-cmd`:
+- `replsh logs --name <name>` — reads `~/.replsh/logs/<name>.log`
+- `--tail N`, `--follow`
+
+**`src/replsh/cli.clj`** — `logs` command dispatch
+
+### Phase 6: Eval output history / replay
+
+When streaming or background evals produce stdout output, the user may want to retrieve the full output later in one go. Two aspects:
+
+1. **Streaming eval output capture**: When `--stream` is used, chunks go to stdout. If the user also wants them persisted, `--stream` could optionally write to a log file alongside stdout. Or: `--bg` already captures to `.jsonl` — this is the persistent version of `--stream`.
+
+2. **Session eval history**: Store eval results (or at least stdout chunks) per session so `replsh output --name <name>` can replay the last eval's output. Most useful when the output was captured to a variable in the REPL but sometimes it's just stdout that the user wants to see again. This could be as simple as writing the last eval's chunks to `~/.replsh/evals/<session>-last.jsonl` on every eval.
 
 ---
 
-## Error Handling
+## Files
 
-| Failure | Behavior |
-|---------|----------|
-| Bad command / missing binary | `spawn!` detects death within 200ms, reads log, throws `:launch-failed` |
-| Process starts but never listens | `wait-for-port!` checks liveness each poll; fails fast if dead, else times out. Catch block kills orphan |
-| Port opens but `backend/open!` fails | Catch block kills spawned process |
-| Init code fails | Throws `:init-failed`, kills process, session NOT persisted |
-| Process dies later | `status-cmd` shows `{:alive false}`. `eval` fails with connection refused. User can `restart` or `stop` |
-| Toolchain not found | Throws at config resolution time with clear message |
-| No config file found | Fine for CLI-only usage. Error only if `--name` used without subcommand and no config |
+| File | Phase | Action |
+|------|-------|--------|
+| `src/replsh/backend/nrepl.clj` | 1, 3 | Return partial on timeout; add `on-chunk` callback |
+| `src/replsh/backend/jupyter.clj` | 1, 3 | Return partial on timeout; add `on-chunk` callback |
+| `src/replsh/backend/node.clj` | 1, 3 | Return partial on timeout; add line-buffered streaming |
+| `src/replsh/command.clj` | 1-5 | Handle partial results, streaming, bg fork, output, logs |
+| `src/replsh/output.clj` | 1, 3 | `partial` support; `emit-chunk!`, `emit-summary!` |
+| `src/replsh/cli.clj` | 2-5 | `--hard-timeout`, `--stream`, `--bg`; `output`, `evals`, `logs` commands |
+| `src/replsh/main.clj` | 3 | Branch on `stream?` for emit path |
+
+---
+
+## Implementation order
+
+Each phase is independently shippable. Phase 1 alone is a major improvement.
+
+1. **Phase 1** (soft timeout) — smallest change, biggest impact. ~30 min.
+2. **Phase 2** (hard timeout) — adds interrupt-on-deadline. Small addition.
+3. **Phase 3** (streaming) — NDJSON output, `on-chunk` callback. Moderate.
+4. **Phase 4** (background) — fork child, output reading. Most complex.
+5. **Phase 5** (logs) — simple file reading. Independent of everything.
 
 ---
 
 ## Verification
 
-```bash
-# 1. Launch from config
-# .replsh/config.edn: {:sessions {"backend" {:toolchain "clojure.bb" :port 1667}}}
-replsh launch --name backend
-replsh eval --name backend '(+ 1 2)'       # → {"ok":true,"data":{"value":"3"}}
-replsh status --name backend               # → {...,"launch":{"pid":...,"alive":true,...}}
-replsh stop backend                        # → kills process, removes session
-
-# 2. Launch with full CLI (no config)
-replsh launch nrepl --name dev --port 1668 \
-  --cmd "bb --nrepl-server 1668"
-replsh eval --name dev '(+ 1 2)'
-
-# 3. Launch with --init
-replsh launch --name backend \
-  --init "(require '[clojure.string :as str])"
-replsh eval --name backend '(str/upper-case "hello")'  # → "HELLO"
-
-# 4. Config override
-replsh launch --name backend --cmd "clj -M:dev:nrepl -m nrepl.cmdline --port {port}"
-
-# 5. Poetry/venv workflow
-# .replsh/config.edn: {:sessions {"ml" {:toolchain "python.poetry" :port 8888 :cwd "ml/"}}}
-replsh launch --name ml
-replsh eval --name ml 'import pandas; print(pandas.__version__)'
-
-# 6. Launch failure
-replsh launch nrepl --name bad --port 9999 --cmd "nonexistent-binary"
-# → {"ok":false,"error":{"code":"launch_failed",...}}
-
-# 7. Restart re-launches
-replsh restart --name backend
-# → kills old process, spawns new one, reconnects
-
-# 8. Start (connect-only, no spawn)
-replsh start --name backend --init "(in-ns 'my.ns)"
-```
+- **Phase 1**: `replsh eval --name dev '(Thread/sleep 60000) :done' --timeout 3000` → returns `{"ok": true, "partial": true, ...}` with exit 0, not timeout error
+- **Phase 2**: Same with `--hard-timeout 5000` → interrupts at 5s, returns `{"ok": false, "error": {"code": "timeout"}}` with exit 3
+- **Phase 3**: `replsh eval --name dev --stream '(doseq [i (range 5)] (println i) (Thread/sleep 500)) :done'` → 5 lines arrive incrementally, summary at end
+- **Phase 4**: `replsh eval --name dev --bg '(Thread/sleep 5000) :done'` → immediate return. `replsh output --eval-id <id>` → shows status.
+- **Phase 5**: `replsh logs --name dev --tail 10` → last 10 lines of server log
+- **Regression**: `replsh eval --name dev '(+ 1 2)'` → identical single JSON as before, exit 0
