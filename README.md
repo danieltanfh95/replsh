@@ -25,10 +25,10 @@ Requires [Babashka](https://babashka.org/).
 # Via bbin (recommended)
 bbin install io.github.g-daniel/replsh
 
-# Or clone and run directly
+# Or clone and install locally
 git clone https://github.com/g-daniel/replsh.git
 cd replsh
-bb -m replsh.main --help
+bbin install . --as replsh
 ```
 
 ## Quick Start

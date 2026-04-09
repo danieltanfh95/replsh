@@ -6,10 +6,18 @@ This project uses replsh (its own tool) for development. You have a live REPL av
 
 ## Setup
 
+Install globally via [bbin](https://github.com/babashka/bbin) (one-time):
+
+```bash
+bbin install .   # from the replsh project dir
+```
+
+This makes `replsh` available from any directory. Without bbin, `bb -m replsh.main` only works from the replsh project root.
+
 The project has `.replsh/config.edn` with a `dev` session. Launch it:
 
 ```bash
-bb -m replsh.main launch --name dev
+replsh launch --name dev
 ```
 
 Port is auto-allocated. The session persists across eval calls.
@@ -20,30 +28,30 @@ Port is auto-allocated. The session persists across eval calls.
 
 ```bash
 # Inline
-bb -m replsh.main eval --name dev '(+ 1 2)'
+replsh eval --name dev '(+ 1 2)'
 
 # From file
-bb -m replsh.main eval --name dev --file src/replsh/util.clj
+replsh eval --name dev --file src/replsh/util.clj
 
 # From stdin (pipe)
-echo '(require (quote [replsh.util :as util])) (util/find-free-port)' | bb -m replsh.main eval --name dev
+echo '(require (quote [replsh.util :as util])) (util/find-free-port)' | replsh eval --name dev
 
 # Stream output (test suites, long-running)
-bb -m replsh.main eval --name dev --stream '(run-tests)'
+replsh eval --name dev --stream '(run-tests)'
 
 # Background eval (returns immediately)
-bb -m replsh.main eval --name dev --bg '(long-task)'
-bb -m replsh.main output --eval-id <id>
+replsh eval --name dev --bg '(long-task)'
+replsh output --eval-id <id>
 ```
 
 **Run tests through the REPL** (faster than cold-starting bb each time):
 
 ```bash
 # Unit tests only (streaming shows progress)
-bb -m replsh.main eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :unit-only? true)' --timeout 60000
+replsh eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :unit-only? true)' --timeout 60000
 
 # All tests (unit + integration)
-bb -m replsh.main eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all)' --timeout 120000
+replsh eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all)' --timeout 120000
 ```
 
 **Or run tests directly** (cold start, simpler):
@@ -56,10 +64,10 @@ bb -m replsh.test-runner --unit   # unit only
 ## Session Management
 
 ```bash
-bb -m replsh.main ls                    # list sessions
-bb -m replsh.main status --name dev     # check reachability
-bb -m replsh.main restart dev           # restart server + re-run init
-bb -m replsh.main stop dev              # kill server, remove session
-bb -m replsh.main logs --name dev       # read server process logs
-bb -m replsh.main evals                 # list background evals
+replsh ls                    # list sessions
+replsh status --name dev     # check reachability
+replsh restart dev           # restart server + re-run init
+replsh stop dev              # kill server, remove session
+replsh logs --name dev       # read server process logs
+replsh evals                 # list background evals
 ```

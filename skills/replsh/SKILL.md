@@ -113,12 +113,10 @@ Install replsh:
 # Via bbin (recommended)
 bbin install io.github.g-daniel/replsh
 
-# Or clone and run directly
+# Or clone and install locally
 git clone https://github.com/g-daniel/replsh.git
-cd replsh && bb -m replsh.main --help
+cd replsh && bbin install . --as replsh
 ```
-
-If running from a clone, substitute `replsh` with `bb -m replsh.main` in all commands below.
 
 ## Getting Started
 

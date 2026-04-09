@@ -71,7 +71,7 @@
 
 (defn launch-cmd
   "Spawn a REPL server process, wait for readiness, connect, and register session."
-  [{:keys [backend-type name host port cmd cwd env kernel token prompt-re init]}]
+  [{:keys [backend-type name host port cmd cwd env kernel token prompt-re init timeout]}]
   (let [effective-cwd (or cwd (System/getProperty "user.dir"))
         ;; Substitute template variables in cmd if not already resolved by config
         cmd (-> cmd
@@ -91,12 +91,12 @@
         (:nrepl :node :python)
         (process/wait-for-port! {:host       (or host "localhost")
                                  :port       port
-                                 :timeout-ms 30000
+                                 :timeout-ms (or timeout 30000)
                                  :process    process})
         :jupyter
         (let [url (str "http://" (or host "localhost") ":" port)]
           (process/wait-for-http! {:url        url
-                                   :timeout-ms 30000
+                                   :timeout-ms (or timeout 30000)
                                    :process    process})))
       ;; 3. Build session config
       (let [transport (case backend-type
