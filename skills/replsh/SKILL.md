@@ -12,7 +12,7 @@ license: EPL-2.0
 compatibility: Requires Babashka (bb) installed. REPL servers started by replsh or running externally.
 metadata:
   author: Daniel Tan
-  repository: https://github.com/g-daniel/replsh
+  repository: https://github.com/danieltanfh95/replsh
 ---
 
 # replsh
@@ -111,10 +111,10 @@ Install replsh:
 
 ```bash
 # Via bbin (recommended)
-bbin install io.github.g-daniel/replsh
+bbin install io.github.danieltanfh95/replsh
 
 # Or clone and install locally
-git clone https://github.com/g-daniel/replsh.git
+git clone https://github.com/danieltanfh95/replsh.git
 cd replsh && bbin install . --as replsh
 ```
 

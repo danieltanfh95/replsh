@@ -23,10 +23,10 @@ Requires [Babashka](https://babashka.org/).
 
 ```bash
 # Via bbin (recommended)
-bbin install io.github.g-daniel/replsh
+bbin install io.github.danieltanfh95/replsh
 
 # Or clone and install locally
-git clone https://github.com/g-daniel/replsh.git
+git clone https://github.com/danieltanfh95/replsh.git
 cd replsh
 bbin install . --as replsh
 ```
