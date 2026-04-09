@@ -1,5 +1,8 @@
+# OS
+.DS_Store
+
 # Editor/tool caches
-.clj-kondo/.cache/
+.clj-kondo/
 .lsp/
 .claude/
 
