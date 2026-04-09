@@ -7,10 +7,10 @@
 │  main.clj          Entry point, exit codes          │
 ├─────────────────────────────────────────────────────┤
 │  cli.clj           Arg parsing, config resolution,  │
-│                    mode detection, handler routing   │
+│                    mode detection, handler routing  │
 ├─────────────────────────────────────────────────────┤
 │  command.clj       Orchestration: launch, eval,     │
-│                    stop, restart, status, interrupt  │
+│                    stop, restart, status, interrupt │
 ├──────────────┬──────────────┬───────────────────────┤
 │  backend/*   │  runtime.clj │  state.clj            │
 │  Protocol    │  Process &   │  Session              │
@@ -37,17 +37,17 @@ CLI: replsh eval --name dev '(+ 1 2)'
  args ["eval" "--name" "dev" "(+ 1 2)"]
   │
   ▼
- main.clj: cli/dispatch(args) ──────────────────────────────────────┐
+ main.clj: cli/dispatch(args) ───────────────────────────────────────┐
   │                                                                  │
   ▼                                                                  │
- cli.clj: babashka.cli/dispatch ──match──► eval-handler             │
-  │  parse opts: {:name "dev", :timeout 30000, :stream false}       │
+ cli.clj: babashka.cli/dispatch ──match──► eval-handler              │
+  │  parse opts: {:name "dev", :timeout 30000, :stream false}        │
   │  resolve code from args / --file / stdin                         │
   │                                                                  │
   ▼                                                                  │
  command.clj: eval-cmd                                               │
   │                                                                  │
-  │  ┌─ state/load-state ──► read ~/.replsh/state.edn               │
+  │  ┌─ state/load-state ──► read ~/.replsh/state.edn                │
   │  │  state/get-session ──► session-config map                     │
   │  │                                                               │
   │  ├─ backend/open! ──► live-state (ephemeral handles)             │
@@ -59,7 +59,7 @@ CLI: replsh eval --name dev '(+ 1 2)'
   │  │                                                               │
   │  ├─ backend/eval! ──► chunk vector                               │
   │  │    sends code over transport, reads responses                 │
-  │  │    each chunk: {:type :value :content "3" :done? true ...}   │
+  │  │    each chunk: {:type :value :content "3" :done? true ...}    │
   │  │    on-chunk callback fires per chunk if --stream              │
   │  │                                                               │
   │  ├─ backend/close! ──► nil                                       │
@@ -69,7 +69,7 @@ CLI: replsh eval --name dev '(+ 1 2)'
   │                                                                  │
   ▼                                                                  │
  output/success or output/failure                                    │
-  {:ok true :command "eval" :data {:value "3" :chunks [...]}}       │
+  {:ok true :command "eval" :data {:value "3" :chunks [...]}}        │
   │                                                                  │
   ▼                                                              ◄───┘
  main.clj: output/emit! ──► JSON to stdout ──► System/exit 0
@@ -225,28 +225,28 @@ runtime/*  dispatches on (:runtime ...)     →  :local | :docker
 
 ### backend/* (src/replsh/backend.clj)
 
-| Method | Dispatches on | Purpose |
-|--------|---------------|---------|
-| `open!` | `(:backend session-config)` | Open transport, return live-state |
-| `close!` | `(:backend live-state)` | Close transport handles |
-| `destroy!` | `(:backend session-config)` | Server-side cleanup (nREPL session close, Jupyter kernel delete) |
-| `eval!` | `(:backend request)` | Send code, collect chunk vector |
-| `interrupt!` | `(:backend live-state)` | Cancel running eval |
+| Method       | Dispatches on               | Purpose                                                          |
+| ------------ | --------------------------- | ---------------------------------------------------------------- |
+| `open!`      | `(:backend session-config)` | Open transport, return live-state                                |
+| `close!`     | `(:backend live-state)`     | Close transport handles                                          |
+| `destroy!`   | `(:backend session-config)` | Server-side cleanup (nREPL session close, Jupyter kernel delete) |
+| `eval!`      | `(:backend request)`        | Send code, collect chunk vector                                  |
+| `interrupt!` | `(:backend live-state)`     | Cancel running eval                                              |
 
 ### runtime/* (src/replsh/runtime.clj)
 
-| Method | Dispatches on | Purpose |
-|--------|---------------|---------|
-| `spawn!` | `:runtime` | Start a process/container |
-| `stop!` | `:runtime` | Kill process / stop+rm container |
-| `alive?` | `:runtime` | Check liveness |
-| `logs` | `:runtime` | Read process/container logs |
-| `send-signal!` | `:runtime` | Send Unix signal |
-| `mapped-port` | `:runtime` | Resolve host-side port |
-| `wait-ready!` | `:runtime` | Poll until TCP/HTTP ready |
-| `deploy-files!` | `:runtime` | Copy files into runtime |
-| `exec!` | `:runtime` | Run command inside runtime, return stdio handles |
-| `deploy-bridge!` | `:runtime` | Deploy Python bridge into runtime |
+| Method           | Dispatches on | Purpose                                          |
+| ---------------- | ------------- | ------------------------------------------------ |
+| `spawn!`         | `:runtime`    | Start a process/container                        |
+| `stop!`          | `:runtime`    | Kill process / stop+rm container                 |
+| `alive?`         | `:runtime`    | Check liveness                                   |
+| `logs`           | `:runtime`    | Read process/container logs                      |
+| `send-signal!`   | `:runtime`    | Send Unix signal                                 |
+| `mapped-port`    | `:runtime`    | Resolve host-side port                           |
+| `wait-ready!`    | `:runtime`    | Poll until TCP/HTTP ready                        |
+| `deploy-files!`  | `:runtime`    | Copy files into runtime                          |
+| `exec!`          | `:runtime`    | Run command inside runtime, return stdio handles |
+| `deploy-bridge!` | `:runtime`    | Deploy Python bridge into runtime                |
 
 ## Transport Modes
 
