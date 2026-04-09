@@ -20,3 +20,6 @@ target/
 
 # Logs
 *.log
+
+# Build artifacts
+*.jar
