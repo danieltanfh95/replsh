@@ -152,7 +152,24 @@ replsh launch node --name frontend --port 5001 \
   --cmd "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen(5001)\""
 ```
 
-### 3. Eval
+### 3. Exec mode (inject REPL into containers)
+
+```bash
+# Into an already-running container (unowned — won't stop it)
+replsh launch python --name api --container my-flask-app
+
+# Start container with its default entrypoint, inject REPL (owned — will stop it)
+replsh launch python --name api --image myapp:latest
+
+# State persists across evals
+replsh eval --name api 'import flask; print(flask.__version__)'
+replsh eval --name api 'x = 42'
+replsh eval --name api 'print(x)'   # → 42
+
+replsh stop api
+```
+
+### 4. Eval
 
 ```bash
 # Inline
@@ -165,7 +182,7 @@ replsh eval --name dev --file script.clj
 echo '(+ 1 2)' | replsh eval --name dev
 ```
 
-### 4. Session lifecycle
+### 5. Session lifecycle
 
 ```bash
 replsh ls                    # list all sessions
@@ -233,6 +250,8 @@ replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 ```bash
 # Session lifecycle
 replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>]
+replsh launch [backend] --name <n> --container <c>   # exec mode: inject into existing container
+replsh launch [backend] --name <n> --image <img>     # exec mode: spawn container, inject REPL
 replsh start  [backend] --name <n> [--port <p>]
 replsh ls
 replsh status --name <n>
@@ -316,6 +335,9 @@ NDJSON — one JSON line per chunk, final line is the summary:
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net')..."` |
+| `clojure.bb.container` | nrepl | Docker: `bb --nrepl-server 0.0.0.0:{port}` |
+| `python.container` | python | Docker: `python3 {bridge} --host 0.0.0.0 --port {port}` |
+| `node.container` | node | Docker: `node -e "require('net')..."` |
 
 Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
 

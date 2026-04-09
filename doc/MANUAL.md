@@ -32,9 +32,19 @@ replsh launch [backend] --name <name> [options]
 | `--env` | `-e` | Environment variable (`K=V`, repeatable) |
 | `--init` | `-i` | Bootstrap code to run after connecting |
 | `--timeout` | `-t` | Port readiness timeout in ms (default: 30000) |
+| `--container` | `-c` | Exec into existing Docker container (exec mode) |
+| `--exec-port` | | Bridge port inside container, exec mode (default: 9876) |
 | `--kernel` | `-k` | Jupyter kernel name (default: `python3`) |
 | `--token` | | Jupyter auth token |
 | `--prompt-re` | | Node.js prompt string (default: `> `) |
+
+**Mode detection:**
+
+| Flags | Mode | Behavior |
+|-------|------|----------|
+| `--cmd` (with or without `--image`) | Port mode | Bridge replaces container entrypoint, port exposed to host |
+| `--container` (no `--cmd`) | Exec mode | Inject bridge into existing container via `docker exec` |
+| `--image` (no `--cmd`) | Exec mode | Spawn container with default entrypoint, inject bridge |
 
 **Examples:**
 
@@ -58,6 +68,38 @@ replsh launch jupyter --name ml --port 8888 \
 # With bootstrap code
 replsh launch --name dev --init "(require '[my.app])"
 ```
+
+#### Exec mode
+
+Exec mode injects a Python REPL into an existing or project container without replacing its entrypoint. The bridge runs persistently inside the container; each eval opens an ephemeral proxy via `docker exec -i`.
+
+```bash
+# Inject REPL into an already-running container
+replsh launch python --name api --container my-flask-app
+
+# Start a container with its default entrypoint, then inject REPL
+replsh launch python --name api --image myapp:latest
+
+# State persists across evals
+replsh eval --name api '1 + 2'        # → 3
+replsh eval --name api 'x = 42'
+replsh eval --name api 'print(x)'    # → 42
+
+# Stop: kills bridge but leaves unowned container running
+replsh stop api
+```
+
+**How it works:**
+
+1. Bridge is deployed into the container via `docker cp`
+2. A persistent bridge server starts inside the container (`python3 /tmp/replsh/replsh_bridge.py --port 9876`), listening on container-internal localhost only (no port exposure)
+3. Each eval opens an ephemeral proxy (`docker exec -i ... --connect 127.0.0.1:9876`) that relays stdin↔TCP
+4. `replsh stop` kills the bridge; if the container was spawned by replsh (`--image`), it also stops the container
+
+**Owned vs unowned containers:**
+
+- `--container <name>`: Container is **unowned** — replsh will not stop it on `replsh stop`
+- `--image <name>`: Container is **owned** — replsh spawned it and will stop+remove it on `replsh stop`
 
 ### start
 
@@ -290,6 +332,17 @@ Searched from the current working directory upward to the filesystem root (like 
 | `:token` | Jupyter auth token |
 | `:prompt-re` | Node.js prompt string |
 | `:env` | Environment variables map |
+| `:container` | Existing Docker container name (exec mode) |
+
+**Exec-mode config example:**
+
+```clojure
+{:sessions
+ {"api" {:toolchain "python.container"
+         :container "di-contracts"}}}
+```
+
+When `:container` is set (or `:image` is set without `:cmd`), replsh uses exec mode — injecting the bridge into the container instead of replacing its entrypoint.
 
 ### Global config — `~/.replsh/config.edn`
 
@@ -336,6 +389,10 @@ Command strings support `{port}`, `{cwd}`, `{host}`, and `{bridge}` placeholders
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` | port 8888, kernel python3 |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` | port 8888, kernel python3 |
 | `node` | node | `node -e "require('net')..."` | port 5001, prompt "> " |
+| `clojure.bb.container` | nrepl | `bb --nrepl-server 0.0.0.0:{port}` | port 1667, Docker |
+| `clojure.deps.container` | nrepl | `clj -M:nrepl ... --bind 0.0.0.0` | port 7888, Docker |
+| `python.container` | python | `python3 {bridge} --host 0.0.0.0 --port {port}` | port 9876, Docker |
+| `node.container` | node | `node -e "require('net')..."` | port 5001, Docker |
 
 ## Output Format
 

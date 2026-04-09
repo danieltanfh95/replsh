@@ -5,14 +5,14 @@ Comparison of what each replsh backend supports.
 | Backend | Transport | Eval | Stdout/Stderr | Errors | State | Interrupt |
 |---------|-----------|------|---------------|--------|-------|-----------|
 | **nREPL** | TCP + bencode | structured | separate chunks | structured with stacktrace | persistent across invocations | supported |
-| **Python** | TCP + NDJSON | expression/statement detection | separate streaming chunks | structured with traceback | persistent namespace | supported (SIGINT) |
+| **Python** | TCP + NDJSON (or exec pipe) | expression/statement detection | separate streaming chunks | structured with traceback | persistent namespace | supported (SIGINT) |
 | **Jupyter** | REST + WebSocket | kernel protocol | separate stream msgs | structured with traceback | persistent kernel | supported |
 | **Node.js** | TCP raw text | prompt detection | mixed (text heuristic) | text only | per-connection | supported (SIGINT) |
 
 ## Notes
 
 - **nREPL**: Sessions are server-side. `def` persists in the namespace across replsh invocations. Multiplexed over a single TCP socket per connection.
-- **Python**: Uses a stdlib-only bridge script (`replsh_bridge.py`) — zero dependencies, auto-deployed. Runs inside the project's Python interpreter (venv, Poetry, conda), so all project packages are available. State persists in a single namespace dict across all evals and connections. Single expressions (e.g., `1 + 1`, `len(xs)`) return values; multi-statement code (e.g., `import x; expr`) compiles as `exec` and does not return a value — use `print()` or split into separate evals.
+- **Python**: Uses a stdlib-only bridge script (`replsh_bridge.py`) — zero dependencies, auto-deployed. Runs inside the project's Python interpreter (venv, Poetry, conda), so all project packages are available. State persists in a single namespace dict across all evals and connections. Single expressions (e.g., `1 + 1`, `len(xs)`) return values; multi-statement code (e.g., `import x; expr`) compiles as `exec` and does not return a value — use `print()` or split into separate evals. Supports two transport modes: **port mode** (TCP, bridge replaces container entrypoint) and **exec mode** (stdio pipes via `docker exec -i`, bridge injected without replacing entrypoint).
 - **Node.js**: Each replsh invocation opens a new TCP connection (= new REPL context). No structured output — stdout and return values are separated by heuristic (last line = value). Errors arrive as text, not structured.
 - **Jupyter**: Kernels are created via REST and persist server-side. Communication over WebSocket using the Jupyter messaging protocol. Avoids ZeroMQ by going through the Jupyter Server's HTTP+WS bridge. Environment vars are passed through to kernel creation. Supports rich output (images, HTML, widgets) that the Python backend does not.
 
@@ -90,3 +90,35 @@ node          ──────────────►   Node.js (raw TCP)
 ```
 
 A toolchain is just a command template + defaults. The backend protocol is determined by the toolchain's `:backend` field. Users can create toolchains for any server that speaks one of the four protocols.
+
+## Exec mode (Python)
+
+The Python backend supports **exec mode** — injecting the bridge into existing or project containers without replacing the container's entrypoint. This is useful when:
+
+- The container runs its own service (Flask, FastAPI, etc.) and you want a REPL alongside it
+- You need to inspect state in an already-running container
+- TCP port exposure doesn't generalize to your environment (SSH, K8s)
+
+### Architecture
+
+```
+Host                           │  Container
+                               │
+replsh eval ──stdin──►         │
+  docker exec -i ...           │  python3 /bridge --connect 127.0.0.1:9876
+    proxy ──TCP──►             │    persistent bridge (--port 9876)
+  ◄──stdout── proxy            │      namespace state persists
+```
+
+1. Bridge is deployed into the container via `docker cp`
+2. A persistent bridge server listens on container-internal `127.0.0.1:9876` (no host port exposure)
+3. Each eval opens an ephemeral proxy (`--connect` mode) that relays stdin↔TCP
+4. The host-side `docker exec` process wraps the bridge — killing it kills the bridge
+
+### Bridge modes
+
+| Flag | Mode | Use |
+|------|------|-----|
+| `--port <N>` | TCP server | Persistent bridge inside container (default) |
+| `--connect <host:port>` | TCP proxy | Ephemeral relay for each eval |
+| `--stdio` | Stdio server | Direct stdin/stdout (future: SSH, K8s) |

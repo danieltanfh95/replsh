@@ -67,58 +67,107 @@
                         :prompt-re    prompt-re
                         :init         init})))))
 
+(defn- exec-mode?
+  "Detect exec mode: --container flag, or --image without --cmd."
+  [opts resolved]
+  (or (:container opts)
+      (and (or (:image opts) (when resolved (:image resolved)))
+           (not (or (:cmd opts) (when resolved (:cmd resolved)))))))
+
 (defn- launch-handler
   [backend-type {:keys [opts args]}]
-  (let [{:keys [name cmd cwd env kernel token prompt-re init port timeout]} opts
-        port (or port (util/find-free-port))
-        ;; Try config resolution
-        resolved (resolve-config name (cond-> {:port port}
-                                        cmd       (assoc :cmd cmd)
-                                        cwd       (assoc :cwd cwd)
-                                        env       (assoc :env (parse-env env))
-                                        init      (assoc :init init)
-                                        kernel    (assoc :kernel kernel)
-                                        token     (assoc :token token)
-                                        prompt-re (assoc :prompt-re prompt-re)))]
-    (if resolved
-      ;; Config-resolved launch
-      (let [bt (or backend-type (:backend-type resolved))]
-        (when-not (:cmd resolved)
-          (throw (ex-info "--cmd is required (not found in config either)"
-                          {:code :missing-arg})))
-        (cmd/launch-cmd {:backend-type bt
-                         :name         name
-                         :host         (or (:host resolved) "localhost")
-                         :port         (:port resolved)
-                         :cmd          (:cmd resolved)
-                         :cwd          (:cwd resolved)
-                         :env          (or (parse-env env) (:env resolved))
-                         :kernel       (or kernel (:kernel resolved))
-                         :token        (or token (:token resolved))
-                         :prompt-re    (or prompt-re (:prompt-re resolved))
-                         :init         (or init (:init resolved))
-                         :timeout      timeout}))
-      ;; CLI-only launch
-      (do
+  (let [{:keys [name cmd cwd env image container volume kernel token prompt-re init port timeout exec-port platform]} opts
+        ;; Try config resolution first (without port) to detect runtime
+        pre-resolved (resolve-config name (cond-> {}
+                                            cmd       (assoc :cmd cmd)
+                                            cwd       (assoc :cwd cwd)
+                                            image     (assoc :image image)
+                                            container (assoc :container container)
+                                            env       (assoc :env (parse-env env))
+                                            init      (assoc :init init)
+                                            kernel    (assoc :kernel kernel)
+                                            token     (assoc :token token)
+                                            prompt-re (assoc :prompt-re prompt-re)))]
+    (if (exec-mode? opts pre-resolved)
+      ;; Exec mode: inject REPL into existing/new container
+      (let [bt (or backend-type
+                    (when pre-resolved (:backend-type pre-resolved))
+                    :python)]
         (when-not name
           (throw (ex-info "--name is required" {:code :missing-arg})))
-        (when-not backend-type
-          (throw (ex-info "Backend type required (e.g., replsh launch nrepl ...)"
+        (when-not (or container image (when pre-resolved (:image pre-resolved)))
+          (throw (ex-info "--container or --image is required for exec mode"
                           {:code :missing-arg})))
-        (when-not cmd
-          (throw (ex-info "--cmd is required" {:code :missing-arg})))
-        (cmd/launch-cmd {:backend-type backend-type
-                         :name         name
-                         :host         "localhost"
-                         :port         port
-                         :cmd          cmd
-                         :cwd          cwd
-                         :env          (parse-env env)
-                         :kernel       kernel
-                         :token        token
-                         :prompt-re    prompt-re
-                         :init         init
-                         :timeout      timeout})))))
+        (cmd/launch-exec-cmd! {:backend-type bt
+                               :name         name
+                               :container    container
+                               :image        (or image (when pre-resolved (:image pre-resolved)))
+                               :env          (or (parse-env env) (when pre-resolved (:env pre-resolved)))
+                               :volumes      (or (seq volume) (when pre-resolved (:volumes pre-resolved)))
+                               :platform     (or platform (when pre-resolved (:platform pre-resolved)))
+                               :init         (or init (when pre-resolved (:init pre-resolved)))
+                               :timeout      timeout
+                               :exec-port    exec-port}))
+      ;; Port mode (existing behavior)
+      (let [is-docker? (or image
+                           (and pre-resolved (:image pre-resolved))
+                           (and pre-resolved (= :docker (:runtime pre-resolved))))
+            ;; Always pre-allocate a port — for local it's the server port,
+            ;; for Docker it's the container-internal port used for -p mapping.
+            port       (or port (util/find-free-port))
+            ;; Resolve config again with port
+            resolved   (resolve-config name (cond-> (if port {:port port} {})
+                                              cmd       (assoc :cmd cmd)
+                                              cwd       (assoc :cwd cwd)
+                                              image     (assoc :image image)
+                                              env       (assoc :env (parse-env env))
+                                              init      (assoc :init init)
+                                              kernel    (assoc :kernel kernel)
+                                              token     (assoc :token token)
+                                              prompt-re (assoc :prompt-re prompt-re)))]
+        (if resolved
+          ;; Config-resolved launch
+          (let [bt (or backend-type (:backend-type resolved))]
+            (when-not (:cmd resolved)
+              (throw (ex-info "--cmd is required (not found in config either)"
+                              {:code :missing-arg})))
+            (cmd/launch-cmd {:backend-type bt
+                             :name         name
+                             :host         (or (:host resolved) "localhost")
+                             :port         (:port resolved)
+                             :cmd          (:cmd resolved)
+                             :cwd          (:cwd resolved)
+                             :image        (or image (:image resolved))
+                             :volumes      (or (seq volume) (:volumes resolved))
+                             :env          (or (parse-env env) (:env resolved))
+                             :kernel       (or kernel (:kernel resolved))
+                             :token        (or token (:token resolved))
+                             :prompt-re    (or prompt-re (:prompt-re resolved))
+                             :init         (or init (:init resolved))
+                             :timeout      timeout}))
+          ;; CLI-only launch
+          (do
+            (when-not name
+              (throw (ex-info "--name is required" {:code :missing-arg})))
+            (when-not backend-type
+              (throw (ex-info "Backend type required (e.g., replsh launch nrepl ...)"
+                              {:code :missing-arg})))
+            (when-not cmd
+              (throw (ex-info "--cmd is required" {:code :missing-arg})))
+            (cmd/launch-cmd {:backend-type backend-type
+                             :name         name
+                             :host         "localhost"
+                             :port         port
+                             :cmd          cmd
+                             :cwd          cwd
+                             :image        image
+                             :volumes      volume
+                             :env          (parse-env env)
+                             :kernel       kernel
+                             :token        token
+                             :prompt-re    prompt-re
+                             :init         init
+                             :timeout      timeout})))))))
 
 (defn- eval-handler
   [{:keys [opts args]}]
@@ -195,8 +244,13 @@
    :init      {:alias :i :desc "Bootstrap code to run on session start"}})
 
 (def ^:private launch-extra
-  {:cmd     {:desc "Command to spawn the REPL server"}
-   :timeout {:alias :t :desc "Port readiness timeout in ms" :coerce :long :default 30000}})
+  {:cmd       {:desc "Command to spawn the REPL server"}
+   :image     {:desc "Docker image for containerized REPL"}
+   :container {:alias :c :desc "Exec into existing Docker container"}
+   :volume    {:alias :v :desc "Volume mount (host:container[:mode])" :coerce []}
+   :platform  {:desc "Docker platform (e.g., linux/amd64)"}
+   :exec-port {:desc "Bridge port inside container (exec mode)" :coerce :long :default 9876}
+   :timeout   {:alias :t :desc "Port readiness timeout in ms" :coerce :long :default 30000}})
 
 (def dispatch-table
   [;; Start (connect to existing server)
@@ -282,6 +336,14 @@ Launch examples:
   replsh launch nrepl --name dev --cmd \"bb --nrepl-server {port}\"
   replsh launch --name ml --init \"import pandas\"
 
+Container examples (port mode — replaces entrypoint):
+  replsh launch nrepl --name dev --cmd \"bb --nrepl-server {port}\" --image babashka/babashka:latest
+  replsh launch --name dev                 # uses clojure.bb.container from config
+
+Exec-mode examples (inject REPL into container):
+  replsh launch python --name api --container my-flask-app
+  replsh launch python --name api --image myapp:latest
+
 Eval examples:
   replsh eval --name dev '(+ 1 2)'          # inline code
   replsh eval --name dev --file script.clj  # from file
@@ -299,7 +361,9 @@ Config files:
   <project>/.replsh/config.edn  Project session definitions
 
 Built-in toolchains: clojure.deps, clojure.lein, clojure.bb,
-                     python, python.poetry, python.venv, node
+                     python, python.poetry, python.venv, node,
+                     clojure.bb.container, clojure.deps.container,
+                     python.container, node.container
 
 All commands emit JSON to stdout. Exit codes: 0=ok, 1=eval error, 2=client error, 3=timeout
 

@@ -6,6 +6,7 @@
             [replsh.backend.python]
             [replsh.bridge :as bridge]
             [replsh.process :as process]
+            [replsh.runtime :as runtime]
             [replsh.state :as state]
             [replsh.output :as output]
             [replsh.util :as util]
@@ -71,77 +72,236 @@
 
 (defn launch-cmd
   "Spawn a REPL server process, wait for readiness, connect, and register session."
-  [{:keys [backend-type name host port cmd cwd env kernel token prompt-re init timeout]}]
-  (let [effective-cwd (or cwd (System/getProperty "user.dir"))
-        ;; Substitute template variables in cmd if not already resolved by config
-        cmd (-> cmd
-                (str/replace "{port}" (str port))
-                (str/replace "{host}" (or host "localhost"))
-                (str/replace "{cwd}" effective-cwd)
-                (str/replace "{bridge}" (try (bridge/ensure-bridge!)
-                                             (catch Exception _ ""))))
-        ;; 1. Spawn the server process
-        {:keys [pid process]} (process/spawn! {:cmd      cmd
-                                               :cwd      effective-cwd
-                                               :env-vars (or env {})
-                                               :name     name})]
+  [{:keys [backend-type name host port cmd cwd env image volumes kernel token prompt-re init timeout]}]
+  (let [runtime-type (if image :docker :local)
+        is-docker?   (= runtime-type :docker)
+        effective-cwd (or cwd (System/getProperty "user.dir"))
+        ;; Template substitution for CLI-only launches (config-resolved cmds are already substituted)
+        cmd (cond-> cmd
+              (str/includes? cmd "{port}")
+              (str/replace "{port}" (str (or port "")))
+              true
+              (str/replace "{host}" (or host "localhost"))
+              is-docker?
+              (str/replace "{cwd}" (or effective-cwd "/workspace"))
+              (not is-docker?)
+              (str/replace "{cwd}" effective-cwd))
+        ;; Build runtime spawn config
+        spawn-config (cond-> {:runtime runtime-type :cmd cmd :name name}
+                       (= runtime-type :local)
+                       (assoc :cwd effective-cwd :env-vars (or env {}))
+
+                       is-docker?
+                       (assoc :image image
+                              :port port
+                              :env-vars (or env {})
+                              :container-cwd "/workspace"))
+
+        ;; For Docker: add bridge mount and substitute container bridge path in cmd
+        spawn-config (if is-docker?
+                       (let [host-bridge (try (bridge/ensure-bridge!) (catch Exception _ nil))
+                             vols        (or volumes [])
+                             cmd         (if host-bridge
+                                           (str/replace cmd "{bridge}" "/tmp/replsh/replsh_bridge.py")
+                                           cmd)
+                             vols        (if host-bridge
+                                           (conj vols (str host-bridge ":/tmp/replsh/replsh_bridge.py:ro"))
+                                           vols)]
+                         (assoc spawn-config :volumes vols :cmd cmd))
+                       ;; Local: substitute bridge path
+                       (update spawn-config :cmd str/replace "{bridge}"
+                               (try (bridge/ensure-bridge!) (catch Exception _ ""))))
+
+        ;; 1. Start the server
+        runtime-info (runtime/spawn! spawn-config)]
+
     (try
-      ;; 2. Wait for port/HTTP readiness
-      (case backend-type
-        (:nrepl :node :python)
-        (process/wait-for-port! {:host       (or host "localhost")
-                                 :port       port
-                                 :timeout-ms (or timeout 30000)
-                                 :process    process})
-        :jupyter
-        (let [url (str "http://" (or host "localhost") ":" port)]
-          (process/wait-for-http! {:url        url
-                                   :timeout-ms (or timeout 30000)
-                                   :process    process})))
-      ;; 3. Build session config
-      (let [transport (case backend-type
-                        :nrepl   {:type :tcp :host (or host "localhost") :port port}
-                        :jupyter {:type :http
-                                  :url (str "http://" (or host "localhost") ":" port)
-                                  :token token}
-                        :node    {:type :tcp :host (or host "localhost") :port port}
-                        :python  {:type :tcp :host (or host "localhost") :port port})
-            session-config {:name         name
-                            :backend      backend-type
-                            :created-at   (util/timestamp)
-                            :transport    transport
-                            :env          {:cwd  effective-cwd
-                                           :vars (or env {})}
-                            :launch       {:cmd cmd
-                                           :cwd effective-cwd
-                                           :pid pid}
-                            :backend-opts (cond-> {}
-                                           kernel    (assoc :kernel-name kernel)
-                                           prompt-re (assoc :prompt-re prompt-re))
-                            :internal     {}}
-            session-config (cond-> session-config
-                             init (assoc :init-code init))
-            ;; 4. Verify connectivity
-            live-state     (backend/open! session-config)
-            session-config (assoc session-config :internal (:internal live-state))
-            state          (state/load-state)]
-        ;; 5. Run init code if provided
-        (when init
-          (try
-            (run-init! session-config live-state init)
-            (catch Exception e
-              (backend/close! live-state)
-              (process/kill! pid)
-              (throw e))))
-        (backend/close! live-state)
-        (state/put-session! state session-config)
-        (output/success :launch {:name    name
-                                 :backend (clojure.core/name backend-type)
-                                 :pid     pid
-                                 :env     (:env session-config)}))
+      ;; 2. Discover actual host port
+      ;;    For Docker: internal port → mapped host port. For local: same port.
+      (let [host-port (or (runtime/mapped-port runtime-info port) port)]
+
+        ;; 3. Wait for port/HTTP readiness (runtime-aware: docker checks container liveness)
+        (case backend-type
+          (:nrepl :node :python)
+          (runtime/wait-ready! runtime-info
+                               {:host       (or host "localhost")
+                                :port       host-port
+                                :timeout-ms (or timeout 30000)
+                                :check      :tcp})
+          :jupyter
+          (runtime/wait-ready! runtime-info
+                               {:url        (str "http://" (or host "localhost") ":" host-port)
+                                :timeout-ms (or timeout 30000)
+                                :check      :http}))
+
+        ;; Brief settle time for server to be protocol-ready
+        (Thread/sleep 500)
+
+        ;; 4. Build session config
+        (let [transport (case backend-type
+                          :nrepl   {:type :tcp :host (or host "localhost") :port host-port}
+                          :jupyter {:type :http
+                                    :url (str "http://" (or host "localhost") ":" host-port)
+                                    :token token}
+                          :node    {:type :tcp :host (or host "localhost") :port host-port}
+                          :python  {:type :tcp :host (or host "localhost") :port host-port})
+              ;; Launch info — runtime-specific identifiers
+              launch-info (cond-> {:cmd cmd :cwd effective-cwd}
+                            (:pid runtime-info)
+                            (assoc :pid (:pid runtime-info))
+                            (:container-id runtime-info)
+                            (assoc :container-id (:container-id runtime-info))
+                            is-docker?
+                            (assoc :image image
+                                   :volumes (:volumes spawn-config)
+                                   :container-cwd "/workspace"))
+              session-config {:name         name
+                              :backend      backend-type
+                              :runtime      runtime-type
+                              :created-at   (util/timestamp)
+                              :transport    transport
+                              :env          {:cwd  effective-cwd
+                                             :vars (or env {})}
+                              :launch       launch-info
+                              :backend-opts (cond-> {}
+                                              kernel    (assoc :kernel-name kernel)
+                                              prompt-re (assoc :prompt-re prompt-re))
+                              :internal     {}}
+              session-config (cond-> session-config
+                               init (assoc :init-code init))
+              ;; 5. Verify connectivity
+              live-state     (backend/open! session-config)
+              session-config (assoc session-config :internal (:internal live-state))
+              state          (state/load-state)]
+          ;; 6. Run init code if provided
+          (when init
+            (try
+              (run-init! session-config live-state init)
+              (catch Exception e
+                (backend/close! live-state)
+                (runtime/stop! runtime-info)
+                (throw e))))
+          (backend/close! live-state)
+          (state/put-session! state session-config)
+          (output/success :launch (cond-> {:name    name
+                                           :backend (clojure.core/name backend-type)
+                                           :runtime (clojure.core/name runtime-type)
+                                           :env     (:env session-config)}
+                                    (:pid runtime-info)
+                                    (assoc :pid (:pid runtime-info))
+                                    (:container-id runtime-info)
+                                    (assoc :container-id (:container-id runtime-info))))))
       (catch Exception e
-        ;; Kill orphaned process on any failure
-        (process/kill! pid)
+        ;; Stop orphaned process/container on any failure
+        (runtime/stop! runtime-info)
+        (throw e)))))
+
+(defn launch-exec-cmd!
+  "Launch exec-mode session: inject REPL bridge into existing/new container.
+   The bridge runs persistently inside the container; each eval opens an ephemeral proxy."
+  [{:keys [backend-type name container image env volumes platform init timeout exec-port]}]
+  (let [exec-port    (or exec-port 9876)
+        owned?       (boolean image)  ;; --image without --cmd → owned container
+        ;; Step 1: Verify or spawn container
+        container-id (if container
+                       ;; Existing container — verify it's running
+                       (do
+                         (when-not (runtime/alive? {:runtime :docker :container-id container})
+                           (throw (ex-info (str "Container not running: " container)
+                                           {:code :container-not-running :container container})))
+                         container)
+                       ;; New container — spawn with image's default entrypoint
+                       (let [runtime-info (runtime/spawn!
+                                            (cond-> {:runtime :docker :cmd nil :name name :image image}
+                                              (seq volumes)  (assoc :volumes volumes)
+                                              (seq env)      (assoc :env-vars env)
+                                              platform       (assoc :platform platform)))]
+                         ;; Wait for the container to be running
+                         (Thread/sleep 1000)
+                         (when-not (runtime/alive? runtime-info)
+                           (runtime/stop! runtime-info)
+                           (throw (ex-info "Container exited immediately"
+                                           {:code :launch-failed :image image})))
+                         (:container-id runtime-info)))
+        runtime-info {:runtime :docker :container-id container-id :name name}]
+    (try
+      ;; Step 2: Deploy bridge into container
+      (let [bridge-path (runtime/deploy-bridge! runtime-info)
+
+            ;; Step 3: Start persistent bridge server inside the container
+            ;; This is a host-side Process wrapping `docker exec` — NOT detached.
+            ;; Killing the host Process kills the bridge.
+            bridge-cmd  (str "python3 " bridge-path " --port " exec-port)
+            bridge-proc (runtime/exec! runtime-info bridge-cmd {})]
+
+        ;; Wait for bridge to start listening
+        (Thread/sleep 1000)
+
+        ;; Step 4: Verify readiness via temporary proxy + ping
+        (let [proxy-handles (runtime/exec! runtime-info
+                                           (str "python3 " bridge-path " --connect 127.0.0.1:" exec-port)
+                                           {})]
+          (try
+            (let [out (:out proxy-handles)]
+              (.println ^java.io.PrintWriter out (cheshire.core/generate-string {:op "ping" :msg_id "launch-ping"}))
+              (.flush ^java.io.PrintWriter out))
+            (let [deadline (+ (System/currentTimeMillis) (or timeout 10000))]
+              (loop []
+                (when (> (System/currentTimeMillis) deadline)
+                  (throw (ex-info "Bridge did not respond to ping"
+                                  {:code :launch-failed :container container-id})))
+                (if (.ready ^java.io.BufferedReader (:in proxy-handles))
+                  (let [line (.readLine ^java.io.BufferedReader (:in proxy-handles))]
+                    (when-not (and line (.contains ^String line "pong"))
+                      (throw (ex-info "Bridge ping failed"
+                                      {:code :launch-failed :response line}))))
+                  (do (Thread/sleep 100) (recur)))))
+            (finally
+              (.destroy ^Process (:process proxy-handles)))))
+
+        ;; Step 5: Build and persist session
+        (let [bridge-pid (.pid ^Process (:process bridge-proc))
+              session-config {:name         name
+                              :backend      backend-type
+                              :runtime      :docker
+                              :created-at   (util/timestamp)
+                              :transport    {:type :exec :exec-port exec-port}
+                              :env          {:cwd  (System/getProperty "user.dir")
+                                             :vars (or env {})}
+                              :launch       {:container-id container-id
+                                             :bridge-pid   bridge-pid
+                                             :bridge-path  bridge-path
+                                             :exec-cmd     bridge-cmd
+                                             :owned        owned?}
+                              :backend-opts {}
+                              :internal     {}}
+              session-config (cond-> session-config
+                               init (assoc :init-code init))
+              ;; Verify full eval connectivity
+              live-state     (backend/open! session-config)
+              session-config (assoc session-config :internal (:internal live-state))
+              state          (state/load-state)]
+          ;; Run init code if provided
+          (when init
+            (try
+              (run-init! session-config live-state init)
+              (catch Exception e
+                (backend/close! live-state)
+                (.destroy ^Process (:process bridge-proc))
+                (when owned? (runtime/stop! runtime-info))
+                (throw e))))
+          (backend/close! live-state)
+          (state/put-session! state session-config)
+          (output/success :launch {:name         name
+                                   :backend      (clojure.core/name backend-type)
+                                   :runtime      "docker"
+                                   :mode         "exec"
+                                   :container-id container-id
+                                   :owned        owned?
+                                   :env          (:env session-config)})))
+      (catch Exception e
+        ;; Clean up on failure
+        (when owned? (runtime/stop! runtime-info))
         (throw e)))))
 
 (defn eval-cmd
@@ -211,9 +371,15 @@
   []
   (let [state (state/load-state)]
     (output/success :ls {:sessions (mapv (fn [[_ s]]
-                                          {:name    (:name s)
-                                           :backend (clojure.core/name (:backend s))
-                                           :env     (:env s)})
+                                          (let [s (runtime/normalize-session s)]
+                                            (cond-> {:name    (:name s)
+                                                     :backend (clojure.core/name (:backend s))
+                                                     :runtime (clojure.core/name (:runtime s))
+                                                     :env     (:env s)}
+                                              (get-in s [:launch :pid])
+                                              (assoc :pid (get-in s [:launch :pid]))
+                                              (get-in s [:launch :container-id])
+                                              (assoc :container-id (get-in s [:launch :container-id])))))
                                         (:sessions state))
                          :active   (:active state)})))
 
@@ -225,14 +391,33 @@
     (when-not session
       (throw (ex-info (str "Session not found: " (or name "(no active session)"))
                       {:code :session-not-found})))
-    ;; Kill launched process if present
-    (when-let [pid (get-in session [:launch :pid])]
-      (process/kill! pid))
-    (try
-      (backend/destroy! session)
-      (catch Exception _))
-    (state/remove-session! state (:name session))
-    (output/success :stop {:name (:name session)})))
+    (if (= :exec (get-in session [:transport :type]))
+      ;; Exec-mode session
+      (let [bridge-pid (get-in session [:launch :bridge-pid])
+            owned?     (get-in session [:launch :owned])]
+        ;; Kill bridge wrapper process
+        (when bridge-pid
+          (try
+            (replsh.process/kill! bridge-pid)
+            (catch Exception _)))
+        ;; If we own the container, stop it too
+        (when owned?
+          (try
+            (runtime/stop! (runtime/session->runtime-info session))
+            (catch Exception _)))
+        (state/remove-session! state (:name session))
+        (output/success :stop {:name (:name session)}))
+      ;; Port-mode / non-exec session (existing behavior)
+      (do
+        (when (:launch session)
+          (try
+            (runtime/stop! (runtime/session->runtime-info session))
+            (catch Exception _)))
+        (try
+          (backend/destroy! session)
+          (catch Exception _))
+        (state/remove-session! state (:name session))
+        (output/success :stop {:name (:name session)})))))
 
 (defn restart-cmd
   "Restart a named session (destroy + re-open)."
@@ -242,39 +427,130 @@
     (when-not session
       (throw (ex-info (str "Session not found: " (or name "(no active session)"))
                       {:code :session-not-found})))
-    (if (:launch session)
-      ;; Launched session: kill → re-spawn → wait → reconnect
-      (let [{:keys [cmd cwd pid]} (:launch session)
-            env-vars (get-in session [:env :vars])]
-        (process/kill! pid)
-        (let [{new-pid :pid new-process :process}
-              (process/spawn! {:cmd cmd :cwd cwd :env-vars env-vars :name name})]
-          (try
-            (case (:backend session)
-              (:nrepl :node :python)
-              (let [{:keys [host port]} (:transport session)]
-                (process/wait-for-port! {:host host :port port
-                                         :timeout-ms 30000 :process new-process}))
-              :jupyter
-              (let [url (get-in session [:transport :url])]
-                (process/wait-for-http! {:url url :timeout-ms 30000 :process new-process})))
-            (let [fresh-config (-> session
+    (cond
+      ;; Exec-mode session: kill bridge → re-deploy → re-start
+      (= :exec (get-in session [:transport :type]))
+      (let [bridge-pid   (get-in session [:launch :bridge-pid])
+            container-id (get-in session [:launch :container-id])
+            exec-port    (get-in session [:transport :exec-port])
+            runtime-info {:runtime :docker :container-id container-id :name name}]
+        ;; Kill existing bridge
+        (when bridge-pid
+          (try (process/kill! bridge-pid) (catch Exception _)))
+        ;; Re-deploy bridge (in case container was restarted)
+        (let [bridge-path  (runtime/deploy-bridge! runtime-info)
+              bridge-cmd   (str "python3 " bridge-path " --port " exec-port)
+              bridge-proc  (runtime/exec! runtime-info bridge-cmd {})]
+          (Thread/sleep 1000)
+          ;; Verify with proxy ping
+          (let [proxy-handles (runtime/exec! runtime-info
+                                             (str "python3 " bridge-path " --connect 127.0.0.1:" exec-port)
+                                             {})]
+            (try
+              (.println ^java.io.PrintWriter (:out proxy-handles)
+                        (json/generate-string {:op "ping" :msg_id "restart-ping"}))
+              (.flush ^java.io.PrintWriter (:out proxy-handles))
+              (let [deadline (+ (System/currentTimeMillis) 10000)]
+                (loop []
+                  (when (> (System/currentTimeMillis) deadline)
+                    (throw (ex-info "Bridge did not respond to ping after restart"
+                                    {:code :restart-failed})))
+                  (if (.ready ^java.io.BufferedReader (:in proxy-handles))
+                    (let [line (.readLine ^java.io.BufferedReader (:in proxy-handles))]
+                      (when-not (and line (.contains ^String line "pong"))
+                        (throw (ex-info "Bridge ping failed" {:code :restart-failed :response line}))))
+                    (do (Thread/sleep 100) (recur)))))
+              (finally
+                (.destroy ^Process (:process proxy-handles)))))
+          ;; Update session with new bridge PID
+          (let [new-bridge-pid (.pid ^Process (:process bridge-proc))
+                fresh-config   (-> session
                                    (assoc :internal {})
-                                   (assoc-in [:launch :pid] new-pid))
-                  live-state   (backend/open! fresh-config)
-                  new-session  (assoc fresh-config :internal (:internal live-state))]
-              ;; Re-run init code if present
-              (when-let [init-code (:init-code session)]
-                (run-init! new-session live-state init-code))
-              (backend/close! live-state)
-              (state/put-session! state new-session)
-              (output/success :restart {:name    (:name session)
-                                        :backend (clojure.core/name (:backend session))
-                                        :pid     new-pid}))
+                                   (assoc-in [:launch :bridge-pid] new-bridge-pid)
+                                   (assoc-in [:launch :bridge-path] bridge-path)
+                                   (assoc-in [:launch :exec-cmd] bridge-cmd))
+                live-state     (backend/open! fresh-config)
+                new-session    (assoc fresh-config :internal (:internal live-state))]
+            (when-let [init-code (:init-code session)]
+              (run-init! new-session live-state init-code))
+            (backend/close! live-state)
+            (state/put-session! state new-session)
+            (output/success :restart {:name         name
+                                      :backend      (clojure.core/name (:backend session))
+                                      :runtime      "docker"
+                                      :mode         "exec"
+                                      :container-id container-id}))))
+
+      ;; Launched (port-mode) session: stop → re-spawn → wait → reconnect
+      (:launch session)
+      (let [{:keys [cmd cwd]} (:launch session)
+            runtime-type (or (:runtime session) :local)
+            env-vars     (get-in session [:env :vars])]
+        ;; Stop existing
+        (try
+          (runtime/stop! (runtime/session->runtime-info session))
+          (catch Exception _))
+        ;; Re-spawn
+        (let [spawn-config (cond-> {:runtime runtime-type :cmd cmd :name name}
+                             (= runtime-type :local)
+                             (assoc :cwd cwd :env-vars env-vars)
+
+                             (= runtime-type :docker)
+                             (assoc :image (get-in session [:launch :image])
+                                    :volumes (get-in session [:launch :volumes])
+                                    :env-vars env-vars
+                                    :container-cwd (or (get-in session [:launch :container-cwd]) "/workspace")))
+              runtime-info (runtime/spawn! spawn-config)]
+          (try
+            (let [host-port (or (runtime/mapped-port runtime-info
+                                                     (get-in session [:transport :port]))
+                                (get-in session [:transport :port]))]
+              (case (:backend session)
+                (:nrepl :node :python)
+                (runtime/wait-ready! runtime-info
+                                     {:host (get-in session [:transport :host])
+                                      :port host-port
+                                      :timeout-ms 30000
+                                      :check :tcp})
+                :jupyter
+                (runtime/wait-ready! runtime-info
+                                     {:url (get-in session [:transport :url])
+                                      :timeout-ms 30000
+                                      :check :http}))
+              (let [;; Update transport with discovered port
+                    session (if (not= host-port (get-in session [:transport :port]))
+                              (assoc-in session [:transport :port] host-port)
+                              session)
+                    launch-info (cond-> {:cmd cmd :cwd cwd}
+                                  (:pid runtime-info)
+                                  (assoc :pid (:pid runtime-info))
+                                  (:container-id runtime-info)
+                                  (assoc :container-id (:container-id runtime-info))
+                                  (get-in session [:launch :image])
+                                  (assoc :image (get-in session [:launch :image])))
+                    fresh-config (-> session
+                                     (assoc :internal {})
+                                     (assoc :launch launch-info))
+                    live-state   (backend/open! fresh-config)
+                    new-session  (assoc fresh-config :internal (:internal live-state))]
+                ;; Re-run init code if present
+                (when-let [init-code (:init-code session)]
+                  (run-init! new-session live-state init-code))
+                (backend/close! live-state)
+                (state/put-session! state new-session)
+                (output/success :restart (cond-> {:name    (:name session)
+                                                  :backend (clojure.core/name (:backend session))
+                                                  :runtime (clojure.core/name runtime-type)}
+                                           (:pid runtime-info)
+                                           (assoc :pid (:pid runtime-info))
+                                           (:container-id runtime-info)
+                                           (assoc :container-id (:container-id runtime-info))))))
             (catch Exception e
-              (process/kill! new-pid)
+              (runtime/stop! runtime-info)
               (throw e)))))
+
       ;; Non-launched session: existing behavior
+      :else
       (do
         (try (backend/destroy! session) (catch Exception _))
         (let [fresh-config (assoc session :internal {})
@@ -296,20 +572,36 @@
     (when-not session
       (throw (ex-info (str "Session not found: " (or name "(no active session)"))
                       {:code :session-not-found})))
-    (let [reachable? (try
+    (let [session  (runtime/normalize-session session)
+          reachable? (try
                        (let [ls (backend/open! session)]
                          (backend/close! ls)
                          true)
                        (catch Exception _ false))]
       (output/success :status (cond-> {:name      (:name session)
                                        :backend   (clojure.core/name (:backend session))
+                                       :runtime   (clojure.core/name (:runtime session))
                                        :transport (:transport session)
                                        :env       (:env session)
                                        :reachable reachable?}
-                               (:launch session)
-                               (assoc :launch {:pid   (get-in session [:launch :pid])
-                                               :alive (process/alive? (get-in session [:launch :pid]))
-                                               :cmd   (get-in session [:launch :cmd])}))))))
+                               (and (:launch session) (= :exec (get-in session [:transport :type])))
+                               (assoc :launch
+                                      (cond-> {:mode  "exec"
+                                               :alive (runtime/alive? (runtime/session->runtime-info session))
+                                               :owned (boolean (get-in session [:launch :owned]))}
+                                        (get-in session [:launch :bridge-pid])
+                                        (assoc :bridge-pid (get-in session [:launch :bridge-pid])
+                                               :bridge-alive (process/alive? (get-in session [:launch :bridge-pid])))
+                                        (get-in session [:launch :container-id])
+                                        (assoc :container-id (get-in session [:launch :container-id]))))
+                               (and (:launch session) (not= :exec (get-in session [:transport :type])))
+                               (assoc :launch
+                                      (cond-> {:cmd   (get-in session [:launch :cmd])
+                                               :alive (runtime/alive? (runtime/session->runtime-info session))}
+                                        (get-in session [:launch :pid])
+                                        (assoc :pid (get-in session [:launch :pid]))
+                                        (get-in session [:launch :container-id])
+                                        (assoc :container-id (get-in session [:launch :container-id])))))))))
 
 (defn interrupt-cmd
   "Interrupt a running eval."
@@ -319,22 +611,35 @@
     (when-not session
       (throw (ex-info (str "Session not found: " (or name "(no active session)"))
                       {:code :session-not-found})))
-    ;; For backends that interrupt via PID (python, node), send SIGINT directly
-    ;; without opening a connection (which would block if the bridge is busy).
-    (if-let [pid (and (#{:python :node} (:backend session))
-                      (get-in session [:launch :pid]))]
-      (do
-        (try
-          (-> (ProcessBuilder. ["kill" "-2" (str pid)]) .start .waitFor)
-          (catch Exception _))
-        (output/success :interrupt {:name (:name session)}))
-      ;; For other backends, open a connection to send the interrupt protocol message
-      (let [live-state (backend/open! session)
-            result     (backend/interrupt! live-state)]
-        (backend/close! live-state)
-        (if (= :ok result)
-          (output/success :interrupt {:name (:name session)})
-          (output/failure :interrupt result))))))
+    (let [session (runtime/normalize-session session)]
+      (cond
+        ;; Exec-mode: send SIGINT to the bridge wrapper Process (host PID)
+        (and (= :exec (get-in session [:transport :type]))
+             (get-in session [:launch :bridge-pid]))
+        (do
+          (try
+            (let [bridge-pid (get-in session [:launch :bridge-pid])]
+              ;; Send SIGINT to the bridge wrapper — Docker propagates into container
+              (-> (ProcessBuilder. ["kill" "-INT" (str bridge-pid)]) .start .waitFor))
+            (catch Exception _))
+          (output/success :interrupt {:name (:name session)}))
+
+        ;; Port-mode backends that interrupt via signal (python, node)
+        (and (#{:python :node} (:backend session)) (:launch session))
+        (do
+          (try
+            (runtime/send-signal! (runtime/session->runtime-info session) "INT")
+            (catch Exception _))
+          (output/success :interrupt {:name (:name session)}))
+
+        ;; Other backends: open a connection to send the interrupt protocol message
+        :else
+        (let [live-state (backend/open! session)
+              result     (backend/interrupt! live-state)]
+          (backend/close! live-state)
+          (if (= :ok result)
+            (output/success :interrupt {:name (:name session)})
+            (output/failure :interrupt result)))))))
 
 ;; --- Background eval ---
 
@@ -476,34 +781,59 @@
         _       (when-not sname
                   (throw (ex-info "No session name provided and no active session"
                                   {:code :missing-arg})))
-        log-file (str logs-dir sname ".log")]
-    (when-not (.exists (File. log-file))
-      (throw (ex-info (str "No log file for session: " sname)
-                      {:code :log-not-found})))
-    (if follow
-      ;; Follow mode: tail log, emit lines as chunks
-      (let [pid (when session (get-in session [:launch :pid]))]
-        (loop [offset 0]
-          (let [content  (slurp log-file)
-                new-part (subs content (min offset (count content)))
-                lines    (when (pos? (count new-part))
-                           (str/split-lines new-part))]
+        session (when session (runtime/normalize-session session))
+        is-docker? (and session (= :docker (:runtime session)))]
+    (cond
+      ;; Docker session: use docker logs
+      is-docker?
+      (let [rt-info (runtime/session->runtime-info session)
+            content (runtime/logs rt-info {:tail tail :follow follow})]
+        (if follow
+          (let [lines (when content (str/split-lines content))]
             (doseq [line lines]
               (output/emit-chunk! {:type :out :content (str line "\n")
                                    :stream :stdout :meta {}}))
-            (let [new-offset (count content)]
-              ;; If process is dead and no new data, we're done
-              (if (and (= new-offset offset)
-                       (or (nil? pid) (not (process/alive? pid))))
-                (cond-> (output/success :logs {:name sname :lines (count (str/split-lines content))})
-                  true (assoc :stream? true))
-                (do
-                  (Thread/sleep 200)
-                  (recur new-offset)))))))
-      ;; Non-follow: dump lines
-      (let [content (slurp log-file)
-            lines   (str/split-lines content)
-            lines   (if tail (vec (take-last tail lines)) (vec lines))]
-        (output/success :logs {:name  sname
-                                :lines (count lines)
-                                :content (str/join "\n" lines)})))))
+            (cond-> (output/success :logs {:name sname :lines (count lines)})
+              true (assoc :stream? true)))
+          (let [lines (when content (str/split-lines content))]
+            (output/success :logs {:name    sname
+                                   :lines   (count lines)
+                                   :content (or content "")}))))
+
+      ;; Follow mode: tail log file, emit lines as chunks
+      follow
+      (let [log-file (str logs-dir sname ".log")]
+        (when-not (.exists (File. log-file))
+          (throw (ex-info (str "No log file for session: " sname)
+                          {:code :log-not-found})))
+        (let [rt-info (runtime/session->runtime-info session)]
+          (loop [offset 0]
+            (let [content  (slurp log-file)
+                  new-part (subs content (min offset (count content)))
+                  lines    (when (pos? (count new-part))
+                             (str/split-lines new-part))]
+              (doseq [line lines]
+                (output/emit-chunk! {:type :out :content (str line "\n")
+                                     :stream :stdout :meta {}}))
+              (let [new-offset (count content)]
+                ;; If process is dead and no new data, we're done
+                (if (and (= new-offset offset)
+                         (not (runtime/alive? rt-info)))
+                  (cond-> (output/success :logs {:name sname :lines (count (str/split-lines content))})
+                    true (assoc :stream? true))
+                  (do
+                    (Thread/sleep 200)
+                    (recur new-offset))))))))
+
+      ;; Non-follow: dump lines from local log file
+      :else
+      (let [log-file (str logs-dir sname ".log")]
+        (when-not (.exists (File. log-file))
+          (throw (ex-info (str "No log file for session: " sname)
+                          {:code :log-not-found})))
+        (let [content (slurp log-file)
+              lines   (str/split-lines content)
+              lines   (if tail (vec (take-last tail lines)) (vec lines))]
+          (output/success :logs {:name    sname
+                                 :lines   (count lines)
+                                 :content (str/join "\n" lines)}))))))

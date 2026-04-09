@@ -3,6 +3,7 @@
             [replsh.util-test]
             [replsh.output-test]
             [replsh.config-test]
+            [replsh.runtime-test]
             [replsh.process-test]
             [replsh.integration-test]))
 
@@ -11,9 +12,10 @@
   [& {:keys [unit-only?]}]
   (let [namespaces (cond-> ['replsh.util-test
                             'replsh.output-test
-                            'replsh.config-test]
-                     (not unit-only?) (into ['replsh.process-test
-                                             'replsh.integration-test]))]
+                            'replsh.config-test
+                            'replsh.runtime-test]
+                   (not unit-only?) (into ['replsh.process-test
+                                           'replsh.integration-test]))]
     (apply t/run-tests namespaces)))
 
 (defn -main [& args]

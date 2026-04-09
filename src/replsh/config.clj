@@ -7,7 +7,8 @@
 ;; --- Built-in toolchain presets ---
 
 (def builtin-toolchains
-  {"clojure.deps"   {:backend  :nrepl
+  {;; --- Local runtimes ---
+   "clojure.deps"   {:backend  :nrepl
                      :cmd      "clj -M:nrepl -m nrepl.cmdline --port {port}"
                      :defaults {:port 7888}}
 
@@ -41,7 +42,36 @@
 
    "node"           {:backend  :node
                      :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port})\""
-                     :defaults {:port 5001 :prompt-re "> "}}})
+                     :defaults {:port 5001 :prompt-re "> "}}
+
+   ;; --- Docker runtimes ---
+   "clojure.bb.container"
+   {:backend  :nrepl
+    :cmd      "bb --nrepl-server 0.0.0.0:{port}"
+    :defaults {:port 1667}
+    :runtime  :docker
+    :image    "babashka/babashka:latest"}
+
+   "clojure.deps.container"
+   {:backend  :nrepl
+    :cmd      "clj -M:nrepl -m nrepl.cmdline --port {port} --bind 0.0.0.0"
+    :defaults {:port 7888}
+    :runtime  :docker
+    :image    "clojure:temurin-21-tools-deps-1.12.0.1530"}
+
+   "python.container"
+   {:backend  :python
+    :cmd      "python3 {bridge} --host 0.0.0.0 --port {port}"
+    :defaults {:port 9876}
+    :runtime  :docker
+    :image    "python:3.12-slim"}
+
+   "node.container"
+   {:backend  :node
+    :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port},'0.0.0.0')\""
+    :defaults {:port 5001 :prompt-re "> "}
+    :runtime  :docker
+    :image    "node:22-slim"}})
 
 ;; --- Config file loading ---
 
@@ -107,6 +137,17 @@
     (let [base (or config-dir (System/getProperty "user.dir"))]
       (.getAbsolutePath (File. ^String base ^String cwd)))))
 
+(defn- container-cwd
+  "Derive the container working directory from volumes config.
+   Uses the container path of the first volume mount, or /workspace as default."
+  [volumes]
+  (or (when (seq volumes)
+        (let [first-vol (first volumes)]
+          (when-let [parts (str/split first-vol #":")]
+            (when (> (count parts) 1)
+              (second parts)))))
+      "/workspace"))
+
 (defn resolve-session
   "Resolve a session by merging: toolchain defaults → toolchain → session spec → CLI opts.
    Returns a flat Resolved Spec map ready for launch-cmd/start-cmd.
@@ -132,19 +173,32 @@
                       (dissoc toolchain :defaults)
                       (dissoc session-spec :toolchain)
                       (into {} (remove (fn [[_ v]] (nil? v))) cli-opts))
-        ;; Resolve cwd
+        ;; Resolve cwd (host path)
         cwd (resolve-cwd (:cwd merged) (:dir project-cfg))
+        ;; Determine runtime (default :local)
+        runtime (or (:runtime merged) :local)
         ;; Build the resolved spec
         resolved (-> merged
                      (assoc :name session-name)
                      (assoc :cwd cwd)
+                     (assoc :runtime runtime)
                      (assoc :backend-type (:backend merged)))
+        ;; For Docker: derive container-cwd from volumes
+        resolved (if (= runtime :docker)
+                   (assoc resolved :container-cwd (container-cwd (:volumes resolved)))
+                   resolved)
         ;; Substitute template variables in :cmd
+        ;; Runtime-aware: {bridge} and {cwd} resolve differently for local vs docker
         resolved (if (:cmd resolved)
-                   (let [template-vals {:port   (or (:port resolved) "")
-                                        :cwd    cwd
-                                        :host   (or (:host resolved) "localhost")
-                                        :bridge (bridge/ensure-bridge!)}]
+                   (let [template-vals
+                         (cond-> {:port (or (:port resolved) "")
+                                  :host (or (:host resolved) "localhost")}
+                           (= runtime :local)
+                           (assoc :cwd    cwd
+                                  :bridge (bridge/ensure-bridge!))
+                           (= runtime :docker)
+                           (assoc :cwd    (or (:container-cwd resolved) "/workspace")
+                                  :bridge "/tmp/replsh/replsh_bridge.py"))]
                      (update resolved :cmd substitute-template template-vals))
                    resolved)
         ;; Derive host from defaults if not set

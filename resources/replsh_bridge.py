@@ -10,6 +10,7 @@ import sys
 import json
 import signal
 import socket
+import threading
 import traceback
 
 
@@ -45,6 +46,17 @@ class StreamWriter:
 
     def isatty(self):
         return False
+
+
+class StdioConn:
+    """Socket-like wrapper over stdin/stdout for stdio mode."""
+
+    def sendall(self, data):
+        sys.__stdout__.buffer.write(data)
+        sys.__stdout__.buffer.flush()
+
+    def makefile(self, mode, encoding='utf-8'):
+        return sys.stdin
 
 
 class ReplBridge:
@@ -140,6 +152,12 @@ class ReplBridge:
         except KeyboardInterrupt:
             pass  # SIGINT outside eval — just close this connection
 
+    def serve_stdio(self):
+        """Serve a single connection over stdin/stdout."""
+        print('replsh bridge stdio mode ready', file=sys.__stderr__)
+        conn = StdioConn()
+        self.handle_connection(conn)
+
     def serve(self):
         """Accept connections in a loop. State persists across connections."""
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -168,12 +186,48 @@ class ReplBridge:
                     pass
 
 
+def connect_proxy(host, port):
+    """Connect to a running bridge via TCP, relay stdin<->TCP.
+
+    Used as an ephemeral proxy: each eval starts one of these to talk
+    to the persistent bridge server inside a container.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+
+    def stdin_to_sock():
+        for line in sys.stdin:
+            try:
+                sock.sendall(line.encode('utf-8'))
+            except (BrokenPipeError, ConnectionResetError):
+                break
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=stdin_to_sock, daemon=True)
+    t.start()
+    buf = sock.makefile('r', encoding='utf-8')
+    for line in buf:
+        sys.__stdout__.write(line)
+        sys.__stdout__.flush()
+    sock.close()
+
+
 if __name__ == '__main__':
     args = sys.argv[1:]
-    host = 'localhost'
-    port = 9876
-    if '--port' in args:
-        port = int(args[args.index('--port') + 1])
-    if '--host' in args:
-        host = args[args.index('--host') + 1]
-    ReplBridge(host, port).serve()
+    if '--stdio' in args:
+        ReplBridge(None, None).serve_stdio()
+    elif '--connect' in args:
+        addr = args[args.index('--connect') + 1]
+        h, p = addr.rsplit(':', 1)
+        connect_proxy(h, int(p))
+    else:
+        host = 'localhost'
+        port = 9876
+        if '--port' in args:
+            port = int(args[args.index('--port') + 1])
+        if '--host' in args:
+            host = args[args.index('--host') + 1]
+        ReplBridge(host, port).serve()

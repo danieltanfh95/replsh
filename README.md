@@ -98,6 +98,28 @@ replsh eval --name dev '(risky-fn)' --timeout 5000 --hard-timeout 60000
 
 Soft timeout (partial output at 5s) + hard timeout (interrupt eval at 60s). `--hard-timeout` sends a backend interrupt — guaranteed to stop the eval.
 
+## Exec Mode (Inject REPL into Containers)
+
+Inject a Python REPL into an existing or project container — without replacing its entrypoint:
+
+```bash
+# Into an already-running container
+replsh launch python --name api --container my-flask-app
+
+# Start a container with its default entrypoint, then inject REPL
+replsh launch python --name api --image myapp:latest
+
+# State persists across evals
+replsh eval --name api 'import sys; print(sys.version)'
+replsh eval --name api 'x = 42'
+replsh eval --name api 'print(x)'   # → 42
+
+# Stop: kills bridge, leaves unowned container running
+replsh stop api
+```
+
+The bridge runs persistently inside the container on localhost (no port exposure). Each eval opens an ephemeral proxy via `docker exec -i`.
+
 ## Session Management
 
 ```bash
@@ -134,6 +156,9 @@ replsh logs --name dev       # read server process logs
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net').createServer(...)..."` |
+| `clojure.bb.container` | nrepl | Docker: `bb --nrepl-server 0.0.0.0:{port}` |
+| `python.container` | python | Docker: `python3 {bridge} --host 0.0.0.0 --port {port}` |
+| `node.container` | node | Docker: `node -e "require('net')..."` |
 
 Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
 

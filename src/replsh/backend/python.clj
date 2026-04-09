@@ -1,7 +1,8 @@
 (ns replsh.backend.python
   (:require [replsh.backend :as backend]
+            [replsh.runtime :as runtime]
             [cheshire.core :as json])
-  (:import [java.net Socket SocketTimeoutException]
+  (:import [java.net Socket]
            [java.io BufferedReader InputStreamReader OutputStreamWriter PrintWriter]
            [java.nio.charset StandardCharsets]))
 
@@ -41,61 +42,79 @@
 (defn- read-eval-responses
   "Read NDJSON responses until done, converting to chunks.
    Calls on-chunk per chunk for streaming.
-   On timeout, throws with accumulated :chunks in ex-data."
+   On timeout, throws with accumulated :chunks in ex-data.
+   Transport-agnostic: uses BufferedReader.ready() polling instead of socket timeout."
   [handles msg-id timeout-ms session-name on-chunk]
-  (let [deadline (if (pos? timeout-ms)
-                   (+ (System/currentTimeMillis) timeout-ms)
-                   Long/MAX_VALUE)
-        ^Socket sock (:socket handles)]
-    (.setSoTimeout sock 500)
-    (try
-      (loop [all-chunks []]
-        (when (> (System/currentTimeMillis) deadline)
-          (throw (ex-info "Timeout waiting for Python response"
-                          {:code :timeout :msg-id msg-id
-                           :chunks all-chunks})))
-        (let [msg (try
-                    (read-json-line (:in handles))
-                    (catch SocketTimeoutException _
-                      nil))]
-          (if-not msg
-            (recur all-chunks)
-            ;; Filter by msg-id
-            (let [resp-id (or (:msg_id msg) (:msg-id msg) "")]
-              (if (not= resp-id msg-id)
-                (recur all-chunks)
-                (let [chunk (msg->chunk msg session-name)]
-                  (when (and on-chunk (not= :status (:type chunk)))
-                    (on-chunk chunk))
-                  (if (:done? chunk)
-                    ;; Done — finalize chunks
-                    (let [all-chunks (if (= :status (:type chunk))
-                                      all-chunks ;; don't add the bare status chunk
-                                      (conj all-chunks chunk))]
-                      (if (seq all-chunks)
-                        (update all-chunks (dec (count all-chunks)) assoc :done? true)
-                        [{:type :status :content "" :meta {} :done? true
-                          :msg-id msg-id :name session-name}]))
-                    (recur (conj all-chunks chunk)))))))))
-      (finally
-        (.setSoTimeout sock 0)))))
+  (let [deadline    (if (pos? timeout-ms)
+                      (+ (System/currentTimeMillis) timeout-ms)
+                      Long/MAX_VALUE)
+        ^BufferedReader in (:in handles)]
+    (loop [all-chunks []]
+      (when (> (System/currentTimeMillis) deadline)
+        (throw (ex-info "Timeout waiting for Python response"
+                        {:code :timeout :msg-id msg-id
+                         :chunks all-chunks})))
+      (let [msg (if (.ready in)
+                  (read-json-line in)
+                  (do (Thread/sleep 50) nil))]
+        (if-not msg
+          (recur all-chunks)
+          ;; Filter by msg-id
+          (let [resp-id (or (:msg_id msg) (:msg-id msg) "")]
+            (if (not= resp-id msg-id)
+              (recur all-chunks)
+              (let [chunk (msg->chunk msg session-name)]
+                (when (and on-chunk (not= :status (:type chunk)))
+                  (on-chunk chunk))
+                (if (:done? chunk)
+                  ;; Done — finalize chunks
+                  (let [all-chunks (if (= :status (:type chunk))
+                                    all-chunks ;; don't add the bare status chunk
+                                    (conj all-chunks chunk))]
+                    (if (seq all-chunks)
+                      (update all-chunks (dec (count all-chunks)) assoc :done? true)
+                      [{:type :status :content "" :meta {} :done? true
+                        :msg-id msg-id :name session-name}]))
+                  (recur (conj all-chunks chunk)))))))))))
+
+(defn- open-via-exec
+  "Start an ephemeral proxy process that connects to the persistent bridge.
+   Returns handles map with :in :out :process."
+  [session-config]
+  (let [exec-port  (get-in session-config [:transport :exec-port])
+        bridge-path (get-in session-config [:launch :bridge-path] "/tmp/replsh/replsh_bridge.py")
+        runtime-info (runtime/session->runtime-info session-config)
+        cmd         (str "python3 " bridge-path " --connect 127.0.0.1:" exec-port)
+        handles     (runtime/exec! runtime-info cmd {})]
+    handles))
+
+(defn- ping-pong!
+  "Send a ping and wait for pong. Throws on failure."
+  [handles]
+  (send-json! handles {:op "ping" :msg_id "open-ping"})
+  (let [deadline (+ (System/currentTimeMillis) 5000)
+        ^BufferedReader in (:in handles)]
+    (loop []
+      (when (> (System/currentTimeMillis) deadline)
+        (throw (ex-info "Python bridge did not respond to ping"
+                        {:code :connection-refused})))
+      (if (.ready in)
+        (let [resp (read-json-line in)]
+          (when-not (= "pong" (:type resp))
+            (throw (ex-info "Python bridge did not respond to ping"
+                            {:code :connection-refused :response resp}))))
+        (do (Thread/sleep 50) (recur))))))
 
 ;; --- Multimethod implementations ---
 
 (defmethod backend/open! :python
   [session-config]
-  (let [{:keys [host port]} (:transport session-config)
-        handles (open-tcp host port)]
-    ;; Verify connectivity with ping
-    (send-json! handles {:op "ping" :msg_id "open-ping"})
-    (.setSoTimeout ^Socket (:socket handles) 5000)
-    (try
-      (let [resp (read-json-line (:in handles))]
-        (when-not (= "pong" (:type resp))
-          (throw (ex-info "Python bridge did not respond to ping"
-                          {:code :connection-refused :response resp}))))
-      (finally
-        (.setSoTimeout ^Socket (:socket handles) 0)))
+  (let [transport-type (get-in session-config [:transport :type])
+        handles (case transport-type
+                  :tcp  (let [{:keys [host port]} (:transport session-config)]
+                          (open-tcp host port))
+                  :exec (open-via-exec session-config))]
+    (ping-pong! handles)
     {:config   session-config
      :backend  :python
      :status   :connected
@@ -104,8 +123,12 @@
 
 (defmethod backend/close! :python
   [live-state]
-  (when-let [sock (get-in live-state [:handles :socket])]
-    (.close ^Socket sock))
+  (let [transport-type (get-in live-state [:config :transport :type])]
+    (case transport-type
+      :tcp  (when-let [sock (get-in live-state [:handles :socket])]
+              (.close ^Socket sock))
+      :exec (when-let [^Process proc (get-in live-state [:handles :process])]
+              (.destroy proc))))
   nil)
 
 (defmethod backend/destroy! :python
@@ -134,14 +157,14 @@
 
 (defmethod backend/interrupt! :python
   [live-state]
-  ;; Send SIGINT to the bridge process
-  (if-let [pid (get-in live-state [:config :launch :pid])]
-    (do
-      (try
-        (-> (ProcessBuilder. ["kill" "-2" (str pid)]) .start .waitFor)
-        (catch Exception _))
-      :ok)
-    {:error   true
-     :code    "unsupported"
-     :message "Interrupt requires a launched session (need PID)"
-     :detail  {}}))
+  (let [session-config (:config live-state)]
+    (if (:launch session-config)
+      (do
+        (try
+          (runtime/send-signal! (runtime/session->runtime-info session-config) "INT")
+          (catch Exception _))
+        :ok)
+      {:error   true
+       :code    "unsupported"
+       :message "Interrupt requires a launched session (need PID or container-id)"
+       :detail  {}})))
