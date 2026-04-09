@@ -31,6 +31,14 @@ cd replsh
 bbin install . --as replsh
 ```
 
+## Add as a Skill
+
+replsh includes a [skills.sh](https://skills.sh/)-compatible [skill document](skills/replsh/SKILL.md) that teaches LLM agents how to use the REPL proactively. To load it, add this line to your project's `CLAUDE.md` or `AGENTS.md`:
+
+```markdown
+Read and follow the replsh skill: https://raw.githubusercontent.com/danieltanfh95/replsh/main/skills/replsh/SKILL.md
+```
+
 ## Quick Start
 
 ```bash
