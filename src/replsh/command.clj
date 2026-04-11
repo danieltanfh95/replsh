@@ -16,6 +16,29 @@
   (:import [java.io File]
            [java.lang ProcessBuilder$Redirect]))
 
+;; Forward declaration: stop-cmd is defined after launch-cmd but
+;; launch-cmd's --force branch needs to call it.
+(declare stop-cmd)
+
+(defn- port-open?
+  "Return true if `host:port` accepts TCP connections right now."
+  [host port]
+  (try
+    (with-open [_ (java.net.Socket. ^String host ^int port)]
+      true)
+    (catch java.io.IOException _ false)))
+
+(defn- session-reachable?
+  "A session is 'live' if either its runtime is alive OR its transport
+   still answers. Either is enough to risk confusion on a silent
+   relaunch."
+  [existing]
+  (or (try (runtime/alive? (runtime/session->runtime-info existing))
+           (catch Exception _ false))
+      (let [{:keys [host port]} (:transport existing)]
+        (when (and host port)
+          (port-open? host port)))))
+
 (defn- run-init!
   "Execute init code on a live connection. Throws on error."
   [session-config live-state init-code]
@@ -53,8 +76,12 @@
                          init (assoc :init-code init))
         ;; Verify connectivity by opening and immediately getting session info
         live-state (backend/open! session-config)
-        ;; Persist with internal state from open (e.g., nREPL session-id)
-        session-config (assoc session-config :internal (:internal live-state))
+        ;; Persist with internal state from open (e.g., nREPL session-id).
+        ;; If the backend probed the connected runtime for its real cwd,
+        ;; trust that over the user-supplied metadata.
+        session-config (cond-> (assoc session-config :internal (:internal live-state))
+                         (get-in live-state [:internal :actual-cwd])
+                         (assoc-in [:env :cwd] (get-in live-state [:internal :actual-cwd])))
         state (state/load-state)]
     ;; Run init code if provided — abort on failure
     (when init
@@ -72,10 +99,49 @@
 
 (defn launch-cmd
   "Spawn a REPL server process, wait for readiness, connect, and register session."
-  [{:keys [backend-type name host port cmd cwd env image volumes kernel token prompt-re init timeout]}]
+  [{:keys [backend-type name host port cmd cwd env image volumes kernel token prompt-re init timeout force]}]
   (let [runtime-type (if image :docker :local)
         is-docker?   (= runtime-type :docker)
         effective-cwd (or cwd (System/getProperty "user.dir"))
+        ;; --- Fix 0: same-name collision check ---
+        ;; If a session with this name already exists and is still
+        ;; reachable, refuse to silently overwrite it.
+        _ (when-let [existing (state/get-session (state/load-state) name)]
+            (cond
+              (not force)
+              (if (session-reachable? existing)
+                (throw (ex-info
+                         (format (str "session %s already exists and is reachable. "
+                                      "Stop it first with `replsh stop %s`, or pass "
+                                      "--force to replace it. "
+                                      "(previous: runtime=%s transport=%s)")
+                                 name name
+                                 (:runtime existing)
+                                 (:transport existing))
+                         {:code :session-exists :name name :existing existing}))
+                ;; Old entry is a corpse — clean up silently and proceed.
+                ;; remove-session! already saves state.
+                (state/remove-session! (state/load-state) name))
+
+              ;; --force: stop the old one first, then proceed.
+              :else
+              (try (stop-cmd {:name name})
+                   (catch Exception e
+                     (binding [*out* *err*]
+                       (println "warning: --force stop failed, proceeding anyway:"
+                                (.getMessage e)))))))
+        ;; --- Fix 1: pre-spawn port collision check (local runtime only) ---
+        ;; Docker publishes its own host port; let the daemon handle that.
+        _ (when (and (not is-docker?) host port (port-open? host port))
+            (throw (ex-info
+                     (format (str "port %s:%s is already listening — something is "
+                                  "bound there and a silent-collision launch would "
+                                  "route you to the existing process instead of the "
+                                  "new one. Kill the existing listener (try "
+                                  "`lsof -iTCP:%s -sTCP:LISTEN`) or choose a "
+                                  "different --port.")
+                             host port port)
+                     {:code :port-already-in-use :host host :port port})))
         ;; Template substitution for CLI-only launches (config-resolved cmds are already substituted)
         cmd (cond-> cmd
               (str/includes? cmd "{port}")
@@ -171,7 +237,11 @@
                                init (assoc :init-code init))
               ;; 5. Verify connectivity
               live-state     (backend/open! session-config)
-              session-config (assoc session-config :internal (:internal live-state))
+              ;; If the backend probed the connected runtime for its real
+              ;; cwd (Fix 2), trust that over the spawn-time metadata.
+              session-config (cond-> (assoc session-config :internal (:internal live-state))
+                               (get-in live-state [:internal :actual-cwd])
+                               (assoc-in [:env :cwd] (get-in live-state [:internal :actual-cwd])))
               state          (state/load-state)]
           ;; 6. Run init code if provided
           (when init

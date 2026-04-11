@@ -76,7 +76,7 @@
 
 (defn- launch-handler
   [backend-type {:keys [opts args]}]
-  (let [{:keys [name cmd cwd env image container volume kernel token prompt-re init port timeout exec-port platform]} opts
+  (let [{:keys [name cmd cwd env image container volume kernel token prompt-re init port timeout exec-port platform force]} opts
         ;; Try config resolution first (without port) to detect runtime
         pre-resolved (resolve-config name (cond-> {}
                                             cmd       (assoc :cmd cmd)
@@ -144,7 +144,8 @@
                              :token        (or token (:token resolved))
                              :prompt-re    (or prompt-re (:prompt-re resolved))
                              :init         (or init (:init resolved))
-                             :timeout      timeout}))
+                             :timeout      timeout
+                             :force        force}))
           ;; CLI-only launch
           (do
             (when-not name
@@ -167,7 +168,8 @@
                              :token        token
                              :prompt-re    prompt-re
                              :init         init
-                             :timeout      timeout})))))))
+                             :timeout      timeout
+                             :force        force})))))))
 
 (defn- eval-handler
   [{:keys [opts args]}]
@@ -250,7 +252,9 @@
    :volume    {:alias :v :desc "Volume mount (host:container[:mode])" :coerce []}
    :platform  {:desc "Docker platform (e.g., linux/amd64)"}
    :exec-port {:desc "Bridge port inside container (exec mode)" :coerce :long :default 9876}
-   :timeout   {:alias :t :desc "Port readiness timeout in ms" :coerce :long :default 30000}})
+   :timeout   {:alias :t :desc "Port readiness timeout in ms" :coerce :long :default 30000}
+   :force     {:alias :f :desc "Replace existing session with same name"
+               :coerce :boolean}})
 
 (def dispatch-table
   [;; Start (connect to existing server)

@@ -135,3 +135,117 @@
       (is (= "itest-ls" (get-in ls-result [:data :sessions 0 :name])))
 
       (cmd/stop-cmd {:name "itest-ls"}))))
+
+(def ^:private base-launch-opts
+  {:backend-type :nrepl
+   :host         "localhost"
+   :env          {}
+   :kernel       nil
+   :token        nil
+   :prompt-re    nil
+   :init         nil
+   :timeout      30000})
+
+(deftest same-name-collision-test
+  (testing "Fix 0 — launching with an existing live name throws :session-exists without --force"
+    (let [launch1 (cmd/launch-cmd (merge base-launch-opts
+                                         {:name "itest-collider"
+                                          :port 16674
+                                          :cmd  "bb --nrepl-server 16674"
+                                          :cwd  "/tmp"}))]
+      (is (true? (:ok launch1)))
+      (try
+        (let [ex (try
+                   (cmd/launch-cmd (merge base-launch-opts
+                                          {:name "itest-collider"
+                                           :port 16675
+                                           :cmd  "bb --nrepl-server 16675"
+                                           :cwd  "/tmp"}))
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+          (is (some? ex) "relaunch should have thrown")
+          (is (= :session-exists (:code (ex-data ex)))))
+        (finally
+          (cmd/stop-cmd {:name "itest-collider"})))))
+
+  (testing "Fix 0 — --force replaces an existing live session"
+    (let [_     (cmd/launch-cmd (merge base-launch-opts
+                                       {:name "itest-forced"
+                                        :port 16676
+                                        :cmd  "bb --nrepl-server 16676"
+                                        :cwd  "/tmp"}))
+          relaunched (cmd/launch-cmd (merge base-launch-opts
+                                            {:name  "itest-forced"
+                                             :port  16677
+                                             :cmd   "bb --nrepl-server 16677"
+                                             :cwd   "/tmp"
+                                             :force true}))]
+      (is (true? (:ok relaunched)))
+      (cmd/stop-cmd {:name "itest-forced"})))
+
+  (testing "Fix 0 — dead corpse is silently cleaned up without --force"
+    ;; Launch a session, then kill the process and remove the port listener so
+    ;; session-reachable? returns false — the corpse should be overwritten
+    ;; silently on the next launch call.
+    (let [launch1 (cmd/launch-cmd (merge base-launch-opts
+                                         {:name "itest-corpse"
+                                          :port 16678
+                                          :cmd  "bb --nrepl-server 16678"
+                                          :cwd  "/tmp"}))
+          pid     (get-in launch1 [:data :pid])]
+      (is (true? (:ok launch1)))
+      ;; Kill the real process (bypassing replsh) so both liveness checks fail
+      (try (process/kill! pid) (catch Exception _))
+      ;; Wait for the port to actually be freed
+      (let [deadline (+ (System/currentTimeMillis) 10000)]
+        (loop []
+          (when (and (< (System/currentTimeMillis) deadline)
+                     (try (let [s (java.net.Socket. "localhost" 16678)]
+                            (.close s)
+                            true)
+                          (catch Exception _ false)))
+            (Thread/sleep 200)
+            (recur))))
+      (let [relaunched (cmd/launch-cmd (merge base-launch-opts
+                                              {:name "itest-corpse"
+                                               :port 16679
+                                               :cmd  "bb --nrepl-server 16679"
+                                               :cwd  "/tmp"}))]
+        (is (true? (:ok relaunched)) "dead corpse should be silently overwritten")
+        (cmd/stop-cmd {:name "itest-corpse"})))))
+
+(deftest port-in-use-test
+  (testing "Fix 1 — launching when the port is already bound throws :port-already-in-use"
+    (let [srv (java.net.ServerSocket. 16680)]
+      (try
+        (let [ex (try
+                   (cmd/launch-cmd (merge base-launch-opts
+                                          {:name "itest-port-busy"
+                                           :port 16680
+                                           :cmd  "bb --nrepl-server 16680"
+                                           :cwd  "/tmp"}))
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+          (is (some? ex) "launch should have aborted")
+          (is (= :port-already-in-use (:code (ex-data ex))))
+          ;; No session should have been written to state
+          (is (nil? (state/get-session (state/load-state) "itest-port-busy"))))
+        (finally
+          (.close srv))))))
+
+(deftest probe-cwd-test
+  (testing "Fix 2 — nrepl open! probes the runtime's real cwd and it lands in session :env :cwd"
+    ;; Use a path that has no symlink indirection so the probed value matches
+    ;; the path we passed. (On macOS, /tmp is a symlink to /private/tmp, and
+    ;; the JVM's user.dir reports the resolved path — which is the point of
+    ;; probing: replsh should report reality, not CLI input.)
+    (let [real-tmp (.getCanonicalPath (File. "/tmp"))
+          _ (cmd/launch-cmd (merge base-launch-opts
+                                   {:name "itest-probe"
+                                    :port 16681
+                                    :cmd  "bb --nrepl-server 16681"
+                                    :cwd  real-tmp}))
+          session (state/get-session (state/load-state) "itest-probe")]
+      (is (= real-tmp (get-in session [:env :cwd]))
+          "session :env :cwd should reflect what the runtime reports, not CLI input")
+      (cmd/stop-cmd {:name "itest-probe"}))))

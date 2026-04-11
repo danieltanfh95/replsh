@@ -1,5 +1,6 @@
 (ns replsh.backend.nrepl
-  (:require [replsh.backend :as backend]
+  (:require [clojure.edn :as edn]
+            [replsh.backend :as backend]
             [replsh.transport.tcp :as tcp]
             [replsh.util :as util])
   (:import [java.net SocketTimeoutException Socket]))
@@ -104,6 +105,25 @@
       (finally
         (.setSoTimeout sock 0)))))
 
+(defn- probe-cwd!
+  "Ask the nrepl server for its runtime cwd. Returns a string or nil.
+   Used to detect cwd drift between what replsh *thinks* the session is
+   in vs what the connected runtime actually reports (Fix 2)."
+  [handles session-id]
+  (try
+    (let [msg-id (send-msg handles {"op"      "eval"
+                                    "code"    "(System/getProperty \"user.dir\")"
+                                    "session" session-id})
+          chunks (read-eval-responses handles msg-id 3000 "probe" nil)
+          value  (->> chunks
+                      (filter #(= :value (:type %)))
+                      first
+                      :content)]
+      (when (string? value)
+        ;; nREPL returns the value pre-escaped — strip one layer of quoting
+        (edn/read-string value)))
+    (catch Exception _ nil)))
+
 ;; --- Multimethod implementations ---
 
 (defmethod backend/open! :nrepl
@@ -118,12 +138,17 @@
                      ;; Create new session via clone
                      (let [msg-id (send-msg handles {"op" "clone"})
                            resps  (read-responses handles msg-id 5000)]
-                       (some #(get % "new-session") resps)))]
+                       (some #(get % "new-session") resps)))
+        ;; Probe the connected runtime for its real cwd. Failures (timeout,
+        ;; odd runtime, nil response) fall through to nil and the caller
+        ;; keeps user-supplied metadata.
+        actual-cwd (probe-cwd! handles session-id)]
     {:config  session-config
      :backend :nrepl
      :status  :connected
      :handles handles
-     :internal {:session-id session-id}}))
+     :internal (cond-> {:session-id session-id}
+                 actual-cwd (assoc :actual-cwd actual-cwd))}))
 
 (defmethod backend/close! :nrepl
   [live-state]
