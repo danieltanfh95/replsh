@@ -121,6 +121,9 @@ replsh launch nrepl --name dev --cmd "bb --nrepl-server {port}"
 # Clojure (deps.edn)
 replsh launch nrepl --name dev --cmd "clj -M:nrepl -m nrepl.cmdline --port {port}"
 
+# Bash (persistent shell — env vars, cwd, functions persist)
+replsh launch bash --name ops --cmd "python3 {bridge} --port {port} --backend bash"
+
 # Python (lightweight — no Jupyter required)
 replsh launch python --name py --cmd "python3 {bridge} --port {port}"
 
@@ -281,7 +284,7 @@ replsh --help                          # full reference
 replsh --install-skill [--path <dest>] # generate skills/replsh/SKILL.md
 ```
 
-Backends: `nrepl`, `python`, `jupyter`, `node`. Optional when using project config.
+Backends: `nrepl`, `python`, `jupyter`, `node`, `bash`. Optional when using project config.
 
 ### Global flags
 
@@ -346,6 +349,8 @@ NDJSON — one JSON line per chunk, last line is the summary:
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net')..."` |
+| `bash` | bash | `python3 {bridge} --port {port} --backend bash` |
+| `bash.container` | bash | Docker: `python3 {bridge} --host 0.0.0.0 --port {port} --backend bash` |
 | `clojure.bb.container` | nrepl | Docker: `bb --nrepl-server 0.0.0.0:{port}` |
 | `clojure.deps.container` | nrepl | Docker: `clj -M:nrepl -m nrepl.cmdline --port {port} --bind 0.0.0.0` |
 | `python.container` | python | Docker: `python3 {bridge} --host 0.0.0.0 --port {port}` |

@@ -40,6 +40,13 @@
                             :cmd      "{cwd}/.venv/bin/jupyter server --port {port}"
                             :defaults {:port 8888 :kernel "python3"}}
 
+   "bash"           {:backend  :bash
+                     :cmd      "python3 {bridge} --port {port} --backend bash"}
+
+   "bash.container" {:backend  :bash
+                     :cmd      "python3 {bridge} --host 0.0.0.0 --port {port} --backend bash"
+                     :runtime  :docker}
+
    "node"           {:backend  :node
                      :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port})\""
                      :defaults {:port 5001 :prompt-re "> "}}
@@ -203,7 +210,7 @@
                    resolved)
         ;; Derive host from defaults if not set
         resolved (if (and (nil? (:host resolved))
-                          (#{:nrepl :node :python} (:backend-type resolved)))
+                          (#{:nrepl :node :python :bash} (:backend-type resolved)))
                    (assoc resolved :host "localhost")
                    resolved)]
     resolved))

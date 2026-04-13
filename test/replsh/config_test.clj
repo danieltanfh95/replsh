@@ -53,6 +53,13 @@
       (is (contains? result "python.poetry"))
       (is (contains? result "node"))))
 
+  (testing "bash toolchains are included"
+    (let [result (config/resolve-toolchains nil)]
+      (is (contains? result "bash"))
+      (is (= :bash (:backend (get result "bash"))))
+      (is (contains? result "bash.container"))
+      (is (= :docker (:runtime (get result "bash.container"))))))
+
   (testing "container toolchains are included"
     (let [result (config/resolve-toolchains nil)]
       (is (contains? result "clojure.bb.container"))

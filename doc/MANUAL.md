@@ -6,7 +6,7 @@
 replsh <command> [options]
 ```
 
-Unified CLI for REPL servers. Manages named sessions across nREPL, Python, Jupyter, and Node.js backends. All output is structured JSON.
+Unified CLI for REPL servers. Manages named sessions across nREPL, Python, Jupyter, Node.js, and Bash backends. All output is structured JSON.
 
 ## Commands
 
@@ -19,7 +19,7 @@ replsh launch [backend] --name <name> [options]
 ```
 
 **Arguments:**
-- `backend` — `nrepl`, `python`, `jupyter`, or `node`. Optional when using project config (derived from toolchain).
+- `backend` — `nrepl`, `python`, `jupyter`, `node`, or `bash`. Optional when using project config (derived from toolchain).
 
 **Options:**
 
@@ -128,8 +128,8 @@ replsh start [backend] --name <name> <address|url>
 ```
 
 **Arguments:**
-- `backend` — `nrepl`, `python`, `jupyter`, or `node`. Optional when using project config.
-- `address` — `host:port` for nREPL/Python/Node, or URL for Jupyter (when not using config).
+- `backend` — `nrepl`, `python`, `jupyter`, `node`, or `bash`. Optional when using project config.
+- `address` — `host:port` for nREPL/Python/Node/Bash, or URL for Jupyter (when not using config).
 
 Options are the same as `launch` minus `--cmd` and `--timeout`.
 
@@ -274,7 +274,7 @@ Cancel a running evaluation.
 replsh interrupt --name <name>
 ```
 
-Supported by all backends: nREPL (interrupt op), Jupyter (REST interrupt), Python (SIGINT), Node (SIGINT).
+Supported by all backends: nREPL (interrupt op), Jupyter (REST interrupt), Python (SIGINT), Node (SIGINT), Bash (SIGINT).
 
 ### evals
 
@@ -406,6 +406,8 @@ Command strings support `{port}`, `{cwd}`, `{host}`, and `{bridge}` placeholders
 | `python.venv` | python | `{cwd}/.venv/bin/python {bridge} --port {port}` | port 9876 |
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` | port 8888, kernel python3 |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` | port 8888, kernel python3 |
+| `bash` | bash | `python3 {bridge} --port {port} --backend bash` | — |
+| `bash.container` | bash | `python3 {bridge} --host 0.0.0.0 --port {port} --backend bash` | Docker |
 | `node` | node | `node -e "require('net')..."` | port 5001, prompt "> " |
 | `clojure.bb.container` | nrepl | `bb --nrepl-server 0.0.0.0:{port}` | port 1667, Docker |
 | `clojure.deps.container` | nrepl | `clj -M:nrepl ... --bind 0.0.0.0` | port 7888, Docker |

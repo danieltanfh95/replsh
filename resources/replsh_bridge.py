@@ -8,8 +8,10 @@ Protocol: NDJSON over TCP. Each message is one JSON object + newline.
 """
 import sys
 import json
+import os
 import signal
 import socket
+import subprocess
 import threading
 import traceback
 
@@ -186,6 +188,109 @@ class ReplBridge:
                     pass
 
 
+class BashBridge(ReplBridge):
+    """ReplBridge variant that evaluates code in a persistent bash subprocess.
+
+    State (env vars, cwd, shell functions) persists across evals because
+    the same bash process handles every eval request.
+    """
+
+    def __init__(self, host, port):
+        super().__init__(host, port)
+        self.bash_proc = subprocess.Popen(
+            ['bash', '--norc', '--noprofile'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+
+    def eval_code(self, code, msg_id, conn):
+        # Replace hyphens so the sentinel is a valid shell token
+        sentinel = '__REPLSH_{}__'.format(msg_id.replace('-', '_'))
+        # Wrap code; echo sentinel + exit code to both streams afterward
+        script = (
+            '{}\n'
+            '__replsh_exit=$?\n'
+            'printf "%s %d\\n" "{}" "$__replsh_exit" >&2\n'
+            'printf "%s %d\\n" "{}" "$__replsh_exit"\n'
+        ).format(code, sentinel, sentinel)
+
+        exit_ref    = [0]
+        interrupted = [False]
+        done_out    = threading.Event()
+        done_err    = threading.Event()
+
+        def read_stream(stream, msg_type, done_event):
+            for raw in iter(stream.readline, b''):
+                line = raw.decode('utf-8', errors='replace')
+                if line.startswith(sentinel):
+                    try:
+                        exit_ref[0] = int(line.split()[-1])
+                    except (ValueError, IndexError):
+                        pass
+                    done_event.set()
+                    return
+                try:
+                    send_msg(conn, {
+                        'type': msg_type,
+                        'content': line,
+                        'stream': 'stdout' if msg_type == 'out' else 'stderr',
+                        'msg_id': msg_id,
+                        'done': False,
+                    })
+                except (BrokenPipeError, ConnectionResetError):
+                    done_event.set()
+                    return
+
+        self._evaluating = True
+        t_out = threading.Thread(target=read_stream,
+                                 args=(self.bash_proc.stdout, 'out', done_out), daemon=True)
+        t_err = threading.Thread(target=read_stream,
+                                 args=(self.bash_proc.stderr, 'err', done_err), daemon=True)
+        try:
+            self.bash_proc.stdin.write(script.encode('utf-8'))
+            self.bash_proc.stdin.flush()
+            t_out.start()
+            t_err.start()
+            done_out.wait()
+            done_err.wait()
+        except KeyboardInterrupt:
+            interrupted[0] = True
+            # Forward interrupt to bash; write emergency sentinel to unblock threads
+            try:
+                os.kill(self.bash_proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                self.bash_proc.stdin.write(
+                    '\nprintf "%s 130\\n" "{}" >&2\nprintf "%s 130\\n" "{}"\n'
+                    .format(sentinel, sentinel).encode())
+                self.bash_proc.stdin.flush()
+            except Exception:
+                pass
+            done_out.wait(timeout=2.0)
+            done_err.wait(timeout=2.0)
+        finally:
+            self._evaluating = False
+
+        if interrupted[0]:
+            send_msg(conn, {'type': 'error', 'content': 'KeyboardInterrupt',
+                            'meta': {'ename': 'KeyboardInterrupt', 'traceback': []},
+                            'msg_id': msg_id, 'done': False})
+        elif exit_ref[0] != 0:
+            send_msg(conn, {'type': 'error',
+                            'content': 'exit code {}'.format(exit_ref[0]),
+                            'meta': {'exit_code': exit_ref[0]},
+                            'msg_id': msg_id, 'done': False})
+        else:
+            send_msg(conn, {'type': 'value', 'content': '0',
+                            'meta': {}, 'msg_id': msg_id, 'done': False})
+
+        send_msg(conn, {'type': 'status', 'content': '', 'meta': {},
+                        'msg_id': msg_id, 'done': True})
+
+
 def connect_proxy(host, port):
     """Connect to a running bridge via TCP, relay stdin<->TCP.
 
@@ -217,17 +322,18 @@ def connect_proxy(host, port):
 
 if __name__ == '__main__':
     args = sys.argv[1:]
+    backend = args[args.index('--backend') + 1] if '--backend' in args else 'python'
+    BridgeClass = BashBridge if backend == 'bash' else ReplBridge
+
     if '--stdio' in args:
-        ReplBridge(None, None).serve_stdio()
+        BridgeClass(None, None).serve_stdio()
     elif '--connect' in args:
         addr = args[args.index('--connect') + 1]
         h, p = addr.rsplit(':', 1)
-        connect_proxy(h, int(p))
+        connect_proxy(h, int(p))          # proxy is backend-agnostic
     else:
         host = 'localhost'
         port = 9876
-        if '--port' in args:
-            port = int(args[args.index('--port') + 1])
-        if '--host' in args:
-            host = args[args.index('--host') + 1]
-        ReplBridge(host, port).serve()
+        if '--port' in args: port = int(args[args.index('--port') + 1])
+        if '--host' in args: host = args[args.index('--host') + 1]
+        BridgeClass(host, port).serve()

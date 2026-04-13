@@ -6,7 +6,8 @@
             [replsh.command :as cmd]
             [replsh.state :as state]
             [replsh.process :as process]
-            [replsh.watch :as watch])
+            [replsh.watch :as watch]
+            replsh.backend.bash)
   (:import [java.io File]))
 
 ;; Use a temp state file so tests don't pollute real state
@@ -304,6 +305,44 @@
                 (is (seq (get-in r2 [:data :stale])) "stale files should be reported after mtime change")))
             (finally
               (cmd/stop-cmd {:name "itest-stale"}))))))))
+
+(deftest bash-launch-eval-stop-test
+  (testing "bash: full lifecycle — env vars and cwd persist across evals"
+    (let [launch-result (cmd/launch-cmd {:backend-type :bash
+                                         :name         "itest-bash"
+                                         :host         "localhost"
+                                         :port         16687
+                                         :cmd          "python3 {bridge} --port {port} --backend bash"
+                                         :cwd          "/tmp"
+                                         :env          {}
+                                         :kernel       nil
+                                         :token        nil
+                                         :prompt-re    nil
+                                         :init         nil
+                                         :timeout      30000})]
+      (is (true? (:ok launch-result)))
+      (is (= "bash" (get-in launch-result [:data :backend])))
+
+      ;; Env var persists across evals
+      (cmd/eval-cmd {:name "itest-bash" :code "export X=hello" :timeout 5000})
+      (let [r (cmd/eval-cmd {:name "itest-bash" :code "echo $X" :timeout 5000})]
+        (is (true? (:ok r)))
+        (is (= "hello\n" (get-in r [:data :output])) "exported env var should persist"))
+
+      ;; cwd change persists
+      (cmd/eval-cmd {:name "itest-bash" :code "cd /tmp" :timeout 5000})
+      (let [r (cmd/eval-cmd {:name "itest-bash" :code "pwd" :timeout 5000})]
+        (is (true? (:ok r)))
+        (is (str/includes? (get-in r [:data :output] "") "/tmp") "cwd should persist"))
+
+      ;; Non-zero exit code is reported as error
+      (let [r (cmd/eval-cmd {:name "itest-bash" :code "false" :timeout 5000})]
+        (is (false? (:ok r)))
+        (is (= "eval_error" (get-in r [:error :code]))))
+
+      ;; Stop
+      (let [stop-result (cmd/stop-cmd {:name "itest-bash"})]
+        (is (true? (:ok stop-result)))))))
 
 ;; --- bbin install smoke tests ---
 ;; These shell out to the actual installed binary to verify end-to-end behavior.

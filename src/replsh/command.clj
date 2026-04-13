@@ -1,5 +1,6 @@
 (ns replsh.command
   (:require [replsh.backend :as backend]
+            [replsh.backend.bash]
             [replsh.backend.nrepl]
             [replsh.backend.node]
             [replsh.backend.jupyter]
@@ -65,7 +66,8 @@
                     :nrepl   (merge {:type :tcp} (util/parse-address address))
                     :jupyter {:type :http :url url :token token}
                     :node    (merge {:type :tcp} (util/parse-address address))
-                    :python  (merge {:type :tcp} (util/parse-address address)))
+                    :python  (merge {:type :tcp} (util/parse-address address))
+                    :bash    (merge {:type :tcp} (util/parse-address address)))
         session-config {:name         name
                         :backend      backend-type
                         :created-at   (util/timestamp)
@@ -192,7 +194,7 @@
 
         ;; 3. Wait for port/HTTP readiness (runtime-aware: docker checks container liveness)
         (case backend-type
-          (:nrepl :node :python)
+          (:nrepl :node :python :bash)
           (runtime/wait-ready! runtime-info
                                {:host       (or host "localhost")
                                 :port       host-port
@@ -214,7 +216,8 @@
                                     :url (str "http://" (or host "localhost") ":" host-port)
                                     :token token}
                           :node    {:type :tcp :host (or host "localhost") :port host-port}
-                          :python  {:type :tcp :host (or host "localhost") :port host-port})
+                          :python  {:type :tcp :host (or host "localhost") :port host-port}
+                          :bash    {:type :tcp :host (or host "localhost") :port host-port})
               ;; Launch info — runtime-specific identifiers
               launch-info (cond-> {:cmd cmd :cwd effective-cwd}
                             (:pid runtime-info)
@@ -618,7 +621,7 @@
                                                      (get-in session [:transport :port]))
                                 (get-in session [:transport :port]))]
               (case (:backend session)
-                (:nrepl :node :python)
+                (:nrepl :node :python :bash)
                 (runtime/wait-ready! runtime-info
                                      {:host (get-in session [:transport :host])
                                       :port host-port
@@ -736,8 +739,8 @@
             (catch Exception _))
           (output/success :interrupt {:name (:name session)}))
 
-        ;; Port-mode backends that interrupt via signal (python, node)
-        (and (#{:python :node} (:backend session)) (:launch session))
+        ;; Port-mode backends that interrupt via signal (python, node, bash)
+        (and (#{:python :node :bash} (:backend session)) (:launch session))
         (do
           (try
             (runtime/send-signal! (runtime/session->runtime-info session) "INT")

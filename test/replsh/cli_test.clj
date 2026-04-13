@@ -69,6 +69,14 @@
         (let [pyc (first (filter #(= "python.container" (:name %)) toolchains))]
           (is (some? pyc) "python.container should be in the list")
           (is (= "docker" (:runtime pyc))))
+        ;; Check bash toolchains
+        (let [b (first (filter #(= "bash" (:name %)) toolchains))]
+          (is (some? b) "bash should be in the list")
+          (is (= "bash" (:backend b)))
+          (is (= "local" (:runtime b))))
+        (let [bc (first (filter #(= "bash.container" (:name %)) toolchains))]
+          (is (some? bc) "bash.container should be in the list")
+          (is (= "docker" (:runtime bc))))
         ;; Should be sorted by name
         (is (= (sort (map :name toolchains))
                (map :name toolchains))

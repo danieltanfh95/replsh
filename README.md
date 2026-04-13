@@ -4,7 +4,7 @@
 
 A thinking medium for LLM agents. Bash gives agents hands — they can move files, invoke tools, run commands. replsh gives them a scratchpad — a persistent, stateful environment where they eval expressions, inspect runtime state, and test hypotheses before committing to code.
 
-Supports Clojure (deps.edn, Leiningen, Babashka), Python (native bridge — zero deps, or Jupyter for rich output), and Node.js over their native protocols. All output is structured JSON. Sessions persist across invocations.
+Supports Clojure (deps.edn, Leiningen, Babashka), Python (native bridge — zero deps, or Jupyter for rich output), Node.js, and Bash (persistent shell — env vars, cwd, and functions survive across evals). All output is structured JSON. Sessions persist across invocations.
 
 ## Why a REPL?
 
@@ -161,6 +161,8 @@ replsh logs --name dev       # read server process logs
 | `python.venv` | python | `{cwd}/.venv/bin/python {bridge} --port {port}` |
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
+| `bash` | bash | `python3 {bridge} --port {port} --backend bash` |
+| `bash.container` | bash | Docker: `python3 {bridge} --host 0.0.0.0 --port {port} --backend bash` |
 | `node` | node | `node -e "require('net').createServer(...)..."` |
 | `clojure.bb.container` | nrepl | Docker: `bb --nrepl-server 0.0.0.0:{port}` |
 | `python.container` | python | Docker: `python3 {bridge} --host 0.0.0.0 --port {port}` |
@@ -189,7 +191,7 @@ CLI args + config → Session Config → state.edn
               sync / stream (NDJSON) / background (fork)
 ```
 
-- **Backends** (nREPL, Python, Jupyter, Node) handle wire protocols via multimethods
+- **Backends** (nREPL, Python, Jupyter, Node, Bash) handle wire protocols via multimethods
 - **Eval modes** — sync (default), streaming (`--stream`), background (`--bg`)
 - **Timeout** — soft (partial output, exit 0) and hard (interrupt, exit 3)
 - **Process management** spawns/kills servers, tracks PIDs

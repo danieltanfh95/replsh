@@ -6,6 +6,7 @@ Comparison of what each replsh backend supports.
 |---------|-----------|------|---------------|--------|-------|-----------|
 | **nREPL** | TCP + bencode | structured | separate chunks | structured with stacktrace | persistent across invocations | supported |
 | **Python** | TCP + NDJSON (or exec pipe) | expression/statement detection | separate streaming chunks | structured with traceback | persistent namespace | supported (SIGINT) |
+| **Bash** | TCP + NDJSON (or exec pipe) | shell commands, any valid bash | separate streaming chunks | exit-code based | persistent (env vars, cwd, functions) | supported (SIGINT) |
 | **Jupyter** | REST + WebSocket | kernel protocol | separate stream msgs | structured with traceback | persistent kernel | supported |
 | **Node.js** | TCP raw text | prompt detection | mixed (text heuristic) | text only | per-connection | supported (SIGINT) |
 
@@ -13,6 +14,7 @@ Comparison of what each replsh backend supports.
 
 - **nREPL**: Sessions are server-side. `def` persists in the namespace across replsh invocations. Multiplexed over a single TCP socket per connection.
 - **Python**: Uses a stdlib-only bridge script (`replsh_bridge.py`) — zero dependencies, auto-deployed. Runs inside the project's Python interpreter (venv, Poetry, conda), so all project packages are available. State persists in a single namespace dict across all evals and connections. Single expressions (e.g., `1 + 1`, `len(xs)`) return values; multi-statement code (e.g., `import x; expr`) compiles as `exec` and does not return a value — use `print()` or split into separate evals. Supports two transport modes: **port mode** (TCP, bridge replaces container entrypoint) and **exec mode** (stdio pipes via `docker exec -i`, bridge injected without replacing entrypoint).
+- **Bash**: Uses the same `replsh_bridge.py` bridge with `--backend bash`. The bridge spawns a single persistent `bash --norc --noprofile` subprocess; all evals are sent to it, so `export`, `cd`, and shell function definitions persist across evals and connections. Stdout/stderr are streamed separately. Requires Python 3 in the target environment (same as the `:python` backend). A zero exit code produces `{"value": "0"}`; non-zero exits produce an error with `{"exit_code": N}`.
 - **Node.js**: Each replsh invocation opens a new TCP connection (= new REPL context). No structured output — stdout and return values are separated by heuristic (last line = value). Errors arrive as text, not structured.
 - **Jupyter**: Kernels are created via REST and persist server-side. Communication over WebSocket using the Jupyter messaging protocol. Avoids ZeroMQ by going through the Jupyter Server's HTTP+WS bridge. Environment vars are passed through to kernel creation. Supports rich output (images, HTML, widgets) that the Python backend does not.
 
@@ -53,6 +55,8 @@ Toolchains define **how to start** a backend server. They are independent from t
 | `python.venv` | Python | `{cwd}/.venv/bin/python {bridge} --port {port}` | 9876 | venv-based Python projects |
 | `python.poetry.jupyter` | Jupyter | `poetry run jupyter server --port {port}` | 8888 | Poetry + rich output (images, HTML) |
 | `python.venv.jupyter` | Jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` | 8888 | venv + rich output (images, HTML) |
+| `bash` | Bash | `python3 {bridge} --port {port} --backend bash` | — | Persistent bash session (env, cwd, functions persist) |
+| `bash.container` | Bash | `python3 {bridge} --host 0.0.0.0 --port {port} --backend bash` | — | Docker: bash session inside container |
 | `node` | Node.js | `node -e "require('net')..."` | 5001 | Node.js projects |
 
 ### Custom toolchains
@@ -81,6 +85,9 @@ clojure.bb    ─┘
 python         ─┐
 python.poetry  ─┼───────────►   Python (NDJSON/TCP)
 python.venv    ─┘
+
+bash           ─┐
+bash.container ─┴───────────►   Bash (NDJSON/TCP, persistent subprocess)
 
 python.poetry.jupyter ─┐
 python.venv.jupyter   ─┼────►   Jupyter (REST+WS)

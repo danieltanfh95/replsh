@@ -39,7 +39,7 @@
       (let [bt (or backend-type (:backend-type resolved))]
         (cmd/start-cmd {:backend-type bt
                         :name         name
-                        :address      (when (#{:nrepl :node :python} bt)
+                        :address      (when (#{:nrepl :node :python :bash} bt)
                                         (str (or (:host resolved) "localhost")
                                              ":" (:port resolved)))
                         :url          (when (= :jupyter bt)
@@ -59,7 +59,7 @@
           (throw (ex-info "Address or URL is required" {:code :missing-arg})))
         (cmd/start-cmd {:backend-type backend-type
                         :name         name
-                        :address      (when (#{:nrepl :node :python} backend-type) address)
+                        :address      (when (#{:nrepl :node :python :bash} backend-type) address)
                         :url          (when (= :jupyter backend-type) url)
                         :cwd          cwd
                         :env          (parse-env env)
@@ -304,6 +304,8 @@
                  {:prompt-re {:desc "Prompt string to detect" :default "> "}})}
    {:cmds ["start" "python"]  :fn (partial start-handler :python)
     :spec base-spec}
+   {:cmds ["start" "bash"]   :fn (partial start-handler :bash)
+    :spec base-spec}
    {:cmds ["start"]           :fn (partial start-handler nil)
     :spec base-spec}
 
@@ -318,6 +320,8 @@
     :spec (merge base-spec launch-extra
                  {:prompt-re {:desc "Prompt string to detect" :default "> "}})}
    {:cmds ["launch" "python"]  :fn (partial launch-handler :python)
+    :spec (merge base-spec launch-extra)}
+   {:cmds ["launch" "bash"]   :fn (partial launch-handler :bash)
     :spec (merge base-spec launch-extra)}
    {:cmds ["launch"]           :fn (partial launch-handler nil)
     :spec (merge base-spec launch-extra)}
