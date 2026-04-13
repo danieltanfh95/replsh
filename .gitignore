@@ -18,6 +18,9 @@ target/
 # Plans (development only)
 .plans/
 
+# Experiments (local scratch)
+.experiments/
+
 # Logs
 *.log
 

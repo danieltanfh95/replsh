@@ -358,6 +358,49 @@ print(df.shape)
 EOF
 ```
 
+## Reasoning Cache
+
+REPL state persists independently of the conversation context window. A stored `def` costs ~50 tokens to retrieve; re-reading the same file costs ~1,500. Use the REPL as working memory to keep context small and survive cache evictions.
+
+### Pattern: compute → store → retrieve
+
+Instead of reading a whole file, eval to extract what you need, then `def` the result:
+
+```bash
+# Clojure — extract and store
+replsh eval --name dev '(def schema (keys (read-string (slurp "deps.edn"))))'
+# later, retrieve cheaply
+replsh eval --name dev 'schema'
+
+# Python — compute and store
+replsh eval --name py 'import json; schema = list(json.load(open("schema.json")).keys())'
+replsh eval --name py 'schema'
+
+# Node
+replsh eval --name frontend 'global.routes = require("./src/routes").map(r => r.path)'
+replsh eval --name frontend 'global.routes'
+```
+
+### Pattern: verify → store → recall
+
+Verify an assumption once, store it, and recall instead of re-verifying:
+
+```bash
+replsh eval --name dev '(def uses-http? (some? (re-find #"http" (slurp "src/my/ns.clj"))))'
+# many turns later — no need to re-read the file
+replsh eval --name dev 'uses-http?'
+```
+
+### When to def
+
+- After reading a complex file — store a summary, not the raw content
+- After computing something expensive — test results, dependency graphs, schema shapes
+- After making a decision — store the conclusion so you don't re-derive it
+
+### What to store
+
+Store **computed values and summaries**, not raw file contents. Good: `(def public-fns (filter :public (analyze-ns 'my.ns)))`. Bad: `(def src (slurp "big-file.clj"))`.
+
 ## Tips
 
 - Port is auto-allocated if not specified — just omit `--port`
