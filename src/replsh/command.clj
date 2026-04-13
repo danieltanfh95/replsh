@@ -11,6 +11,7 @@
             [replsh.state :as state]
             [replsh.output :as output]
             [replsh.util :as util]
+            [replsh.watch :as watch]
             [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.string :as str])
@@ -390,8 +391,9 @@
           effective-timeout (min soft-ms hard-ms)
           hard-deadline (when (and hard-timeout (pos? hard-timeout))
                           (+ (System/currentTimeMillis) hard-timeout))
-          live-state (backend/open! session)
-          msg-id     (util/gen-id "eval")
+          live-state     (backend/open! session)
+          detect-result  (watch/detect-stale session live-state)
+          msg-id         (util/gen-id "eval")
           on-chunk   (when stream? output/emit-chunk!)
           request    {:code       code
                       :name       (:name session)
@@ -407,7 +409,9 @@
       (when hard-expired?
         (try (backend/interrupt! live-state) (catch Exception _)))
       ;; Update internal state (e.g., nREPL ns may have changed)
-      (let [new-session (assoc session :internal (:internal live-state))]
+      (let [new-session (cond-> (assoc session :internal (:internal live-state))
+                          true                           (assoc :last-eval-at (System/currentTimeMillis))
+                          (:loaded-mtimes detect-result) (assoc :loaded-mtimes (:loaded-mtimes detect-result)))]
         (backend/close! live-state)
         (state/put-session! state new-session)
         (let [clean-chunks (mapv #(select-keys % [:type :content :stream :meta]) chunks)
@@ -446,10 +450,11 @@
                                                               chunked?     (assoc :chunks clean-chunks))}))
                            (output/success :eval
                                            (cond-> {:name (:name session)}
-                                             value-chunk  (assoc :value (:content value-chunk))
-                                             (seq stdout) (assoc :output stdout)
-                                             chunked?     (assoc :chunks clean-chunks)
-                                             (get-in value-chunk [:meta :ns]) (assoc :ns (get-in value-chunk [:meta :ns])))))]
+                                             value-chunk              (assoc :value (:content value-chunk))
+                                             (seq stdout)             (assoc :output stdout)
+                                             chunked?                 (assoc :chunks clean-chunks)
+                                             (get-in value-chunk [:meta :ns]) (assoc :ns (get-in value-chunk [:meta :ns]))
+                                             (:stale detect-result)   (assoc :stale (:stale detect-result)))))]
               (cond-> result
                 (not timed-out?) (assoc :status "complete")
                 timed-out?       (assoc :status "partial")

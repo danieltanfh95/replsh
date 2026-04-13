@@ -283,6 +283,7 @@ One JSON object on stdout:
 {"ok": true, "command": "eval", "status": "complete", "data": {"value": "42", "output": "hello\n", "ns": "user"}}
 {"ok": true, "command": "eval", "status": "partial", "data": {"value": "42", "output": "partial stdout..."}}
 {"ok": false, "command": "eval", "status": "complete", "error": {"code": "eval_error", "message": "..."}}
+{"ok": true, "command": "eval", "status": "complete", "data": {"value": "42", "stale": [{"ns": "replsh.util", "file": "src/replsh/util.clj"}]}}
 ```
 
 ### Streaming eval (`--stream`)
@@ -302,6 +303,7 @@ NDJSON — one JSON line per chunk, last line is the summary:
 - `data.output` — joined stdout (only present when non-empty)
 - `status` — `"complete"` (eval finished), `"partial"` (eval timed out), or `"streaming"` (live NDJSON chunk, more coming)
 - `data.chunks` — raw chunk array, only present with `--chunked` flag
+- `data.stale` — list of `{"ns": "...", "file": "..."}` objects for loaded modules whose source files changed on disk since the last eval; absent when nothing is stale. Only checked after the session has been idle for 30+ minutes.
 - Exit codes: always 0 by default. With `--exit-on-error`: 0=success, 1=eval error, 2=client error, 3=hard timeout
 
 ## Config
