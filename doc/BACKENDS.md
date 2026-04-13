@@ -8,7 +8,7 @@ Comparison of what each replsh backend supports.
 | **Python** | TCP + NDJSON (or exec pipe) | expression/statement detection | separate streaming chunks | structured with traceback | persistent namespace | supported (SIGINT) |
 | **Bash** | TCP + NDJSON (or exec pipe) | shell commands, any valid bash | separate streaming chunks | exit-code based | persistent (env vars, cwd, functions) | supported (SIGINT) |
 | **Jupyter** | REST + WebSocket | kernel protocol | separate stream msgs | structured with traceback | persistent kernel | supported |
-| **Node.js** | TCP raw text | prompt detection | mixed (text heuristic) | text only | per-connection | supported (SIGINT) |
+| **Node.js** | TCP raw text | prompt detection | mixed (text heuristic) | text only | per-connection | best-effort (SIGINT to process if locally launched; no protocol interrupt) |
 
 ## Notes
 
@@ -117,7 +117,7 @@ replsh eval ──stdin──►         │
   ◄──stdout── proxy            │      namespace state persists
 ```
 
-1. Bridge is deployed into the container via `docker cp`
+1. Bridge is deployed into the target via stdin piping: the bridge script is piped through `docker exec -i` (and/or SSH) using `cat >`. No `docker cp` — this works across SSH tunnels and without Docker host access.
 2. A persistent bridge server listens on container-internal `127.0.0.1:9876` (no host port exposure)
 3. Each eval opens an ephemeral proxy (`--connect` mode) that relays stdin↔TCP
 4. The host-side `docker exec` process wraps the bridge — killing it kills the bridge

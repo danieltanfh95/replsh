@@ -237,13 +237,13 @@ replsh eval --name dev '(expensive-fn)' --timeout 5000 --hard-timeout 60000
 replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 ```
 
-`--hard-timeout` interrupts the eval server-side (nREPL interrupt, Jupyter interrupt, SIGINT for Python/Node). Returns `"status": "partial"` and exit code 3. Use when you need to guarantee the eval stops.
+`--hard-timeout` interrupts the eval server-side (nREPL interrupt, Jupyter interrupt, SIGINT for Python/Bash). Node interrupt is best-effort only — see `interrupt` command notes. Returns `"status": "partial"` and exit code 3. Use when you need to guarantee the eval stops.
 
 ## Command Reference
 
 ```bash
 # Session lifecycle
-replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>] [--force]
+replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>] [--force] [--volume <host:container[:opts]>] [--platform <platform>]
 replsh launch [backend] --name <n> --container <c>                    # exec mode: inject into existing container
 replsh launch [backend] --name <n> --image <img>                      # exec mode: spawn container, inject REPL
 replsh launch [backend] --name <n> --ssh-host <host> [--container <c>]  # exec mode: via SSH
@@ -285,6 +285,12 @@ replsh --install-skill [--path <dest>] # generate skills/replsh/SKILL.md
 ```
 
 Backends: `nrepl`, `python`, `jupyter`, `node`, `bash`. Optional when using project config.
+
+### Launch flag notes
+
+- `--force` — replaces an existing live session with the same name (stop + relaunch without error)
+- `--volume` / `-v` — Docker volume mount (`host:container[:opts]`, repeatable). Requires `--image`.
+- `--platform` — Docker platform override (e.g., `linux/amd64`). Requires `--image`.
 
 ### Global flags
 

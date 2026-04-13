@@ -205,15 +205,15 @@ CLI: replsh launch python --name api --ssh-host my-machine --container my-app
 
 ```clojure
 ;; Success
-{:ok true :command "eval" :data {:name "dev" :value "3" :chunks [...]}}
+{:ok true :command "eval" :data {:name "dev" :value "3"}}
 
 ;; Failure
 {:ok false :command "eval"
  :error {:code "eval_error" :message "ArithmeticException: Divide by zero"}
  :data {:chunks [...]}}
 
-;; Streaming final line
-{:ok true :command "eval" :data {...} :final true}
+;; Streaming final line (same shape as sync output)
+{:ok true :command "eval" :data {...}}
 ```
 
 ## Multimethod Dispatch
@@ -285,12 +285,14 @@ src/replsh/
 ├── process.clj          Local PID management (spawn, kill, wait)
 ├── bridge.clj           Python bridge deployment to ~/.replsh/bridge/
 ├── util.clj             IDs, port allocation, address parsing
+├── watch.clj            Stale-file detection (idle-gated module introspection)
 ├── backend.clj          Backend multimethod definitions
 └── backend/
     ├── nrepl.clj        nREPL protocol (bencode over TCP)
     ├── python.clj       Python bridge protocol (NDJSON over TCP or exec pipe)
     ├── jupyter.clj      Jupyter protocol (REST + WebSocket)
-    └── node.clj         Node.js protocol (raw TCP text)
+    ├── node.clj         Node.js protocol (raw TCP text)
+    └── bash.clj         Bash protocol (delegates to python.clj runtime, bash subprocess)
 
 resources/
 └── replsh_bridge.py     Python bridge script (deployed into containers)

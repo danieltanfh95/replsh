@@ -33,6 +33,10 @@ replsh launch [backend] --name <name> [options]
 | `--init` | `-i` | Bootstrap code to run after connecting |
 | `--timeout` | `-t` | Port readiness timeout in ms (default: 30000) |
 | `--container` | `-c` | Exec into existing Docker container (exec mode) |
+| `--image` | | Docker image — exec mode (no `--cmd`) or port mode (with `--cmd`) |
+| `--force` | `-f` | Replace an existing live session with the same name without error |
+| `--volume` | `-v` | Docker volume mount (`host:container[:opts]`, repeatable). Requires `--image`. |
+| `--platform` | | Docker platform override (e.g., `linux/amd64`). Requires `--image`. |
 | `--ssh-host` | | SSH host or `~/.ssh/config` alias — triggers exec mode via SSH |
 | `--exec-port` | | Bridge port inside container, exec mode (default: 9876) |
 | `--kernel` | `-k` | Jupyter kernel name (default: `python3`) |
@@ -167,6 +171,7 @@ echo '<code>' | replsh eval --name <name>
 | `--hard-timeout` | | Hard timeout in ms. Interrupts the eval server-side on expiry. Exit code 3. |
 | `--stream` | `-s` | Stream output as NDJSON (one JSON line per chunk). |
 | `--bg` | | Run eval in a background process. Returns an eval-id immediately. |
+| `--chunked` | | Include raw `data.chunks` array in the output envelope. Absent by default. |
 
 #### Timeout behavior
 
@@ -177,7 +182,7 @@ By default, `--timeout` is 30000ms (30 seconds). When the soft timeout fires:
 
 When `--hard-timeout` fires:
 
-- replsh sends an interrupt to the backend (nREPL interrupt op, Jupyter REST interrupt, SIGINT for Python/Node).
+- replsh sends an interrupt to the backend (nREPL interrupt op, Jupyter REST interrupt, SIGINT for Python/Bash). Node interrupt is best-effort only — replsh sends SIGINT to the server process if locally launched; does not stop evals inside a remote or containerised Node session.
 - Returns as a **timeout error**: exit code 3.
 - Guaranteed to stop the eval.
 
@@ -274,7 +279,11 @@ Cancel a running evaluation.
 replsh interrupt --name <name>
 ```
 
-Supported by all backends: nREPL (interrupt op), Jupyter (REST interrupt), Python (SIGINT), Node (SIGINT), Bash (SIGINT).
+Backend support:
+- **nREPL**: interrupt op (protocol-level)
+- **Jupyter**: REST interrupt (protocol-level)
+- **Python / Bash**: SIGINT to process (reliable for locally-launched sessions)
+- **Node**: best-effort — no protocol-level interrupt. replsh sends SIGINT to the server process if the session was launched by replsh; does not stop evals inside a remote or containerised Node session.
 
 ### evals
 
@@ -285,6 +294,42 @@ replsh evals
 ```
 
 Returns eval-id, session, status (`running`, `completed`, `failed`, `timeout`), timestamps, and PID for each background eval.
+
+### history
+
+Show recent eval history for a session.
+
+```
+replsh history --name <name>
+replsh history --name <name> --format script
+```
+
+| Flag | Alias | Description |
+|------|-------|-------------|
+| `--name` | `-n` | Session name |
+| `--format` | | `json` (default) or `script` (one form per line, blank-line separated) |
+
+`--format script` emits code forms only — useful for piping back into `replay`.
+
+### replay
+
+Re-evaluate each top-level form from code or a file sequentially.
+
+```
+replsh replay --name <name> '<code>'
+replsh replay --name <name> --file <path>
+```
+
+| Flag | Alias | Description |
+|------|-------|-------------|
+| `--name` | `-n` | Session name |
+| `--file` | `-f` | Read code from file (use `/dev/stdin` for pipe) |
+| `--timeout` | `-t` | Soft timeout per form in ms (default: 30000) |
+| `--hard-timeout` | | Hard timeout per form in ms |
+
+Form splitting is backend-aware: Clojure splits on top-level EDN forms; Python/Jupyter on `\n# ---\n`; Node on `\n// ---\n`; Bash treats the whole input as one form.
+
+Returns `data.forms` (count) and `data.results` (per-form eval results array).
 
 ### output
 
@@ -321,6 +366,12 @@ replsh logs --name <name> --follow
 | `--follow` | `-f` | Tail log until process exits |
 
 Reads from `~/.replsh/logs/<name>.log`. Only available for sessions started with `launch`.
+
+## Global Flags
+
+| Flag | Description |
+|------|-------------|
+| `--exit-on-error` | Exit with non-zero codes on failure (default: always exit 0). Use in CI pipelines or scripts. |
 
 ## Configuration
 
@@ -429,6 +480,20 @@ All commands emit exactly one JSON object on stdout.
   "data": {
     "name": "dev",
     "value": "3",
+    "ns": "user"
+  }
+}
+```
+
+When `--chunked` is passed, `data.chunks` contains the raw chunk array:
+
+```json
+{
+  "ok": true,
+  "command": "eval",
+  "data": {
+    "name": "dev",
+    "value": "3",
     "ns": "user",
     "chunks": [
       {"type": "out", "content": "hello\n", "stream": "stdout"},
@@ -445,7 +510,7 @@ All commands emit exactly one JSON object on stdout.
   "ok": true,
   "command": "eval",
   "status": "partial",
-  "data": {"name": "dev", "chunks": [...]}
+  "data": {"name": "dev", "output": "..."}
 }
 ```
 
@@ -485,6 +550,12 @@ NDJSON — one JSON line per chunk, final line is the summary envelope:
 | `error` | Evaluation error |
 | `status` | Status message |
 
+### Notable output fields
+
+- `data.stale` — list of `{"ns": "...", "file": "..."}` objects for loaded modules whose source files changed on disk since the last eval. Only populated after the session has been idle for 30+ minutes (configurable via `REPLSH_WATCH_IDLE_MS`). Absent when nothing is stale.
+- `data.chunks` — raw chunk array; only present when `--chunked` is passed.
+- `data.output` — joined stdout string (present when stdout was captured).
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -501,6 +572,7 @@ NDJSON — one JSON line per chunk, final line is the summary envelope:
 | `REPLSH_CONFIG` | Override project config file path |
 | `REPLSH_CONFIG_GLOBAL` | Override global config file path |
 | `REPLSH_STATE` | Override state file path (default: `~/.replsh/state.edn`) |
+| `REPLSH_WATCH_IDLE_MS` | Override idle threshold for stale-file detection in ms (default: `1800000` = 30 min). Set small (e.g., `100`) to force stale checks during testing. |
 
 ## Files
 
