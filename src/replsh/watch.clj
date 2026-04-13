@@ -34,13 +34,12 @@
 
     (:python :jupyter)
     (str "import sys, os, json\n"
-         "cwd = os.getcwd()\n"
-         "result = []\n"
-         "for name, mod in list(sys.modules.items()):\n"
-         "    f = getattr(mod, '__file__', None)\n"
-         "    if f and os.path.isfile(f) and os.path.abspath(f).startswith(cwd):\n"
-         "        result.append({'ns': name, 'file': os.path.relpath(f, cwd), 'mtime': os.path.getmtime(f)})\n"
-         "json.dumps(result)")
+         "(lambda: json.dumps(\n"
+         "  [{'ns': n, 'file': os.path.relpath(f, c), 'mtime': os.path.getmtime(f)}\n"
+         "   for c in [os.getcwd()]\n"
+         "   for n, m in list(sys.modules.items())\n"
+         "   for f in [getattr(m, '__file__', None)]\n"
+         "   if f and os.path.isfile(f) and os.path.abspath(f).startswith(c)]))()")
 
     :node
     (str "const fs = require('fs'), path = require('path');\n"

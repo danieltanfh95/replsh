@@ -133,7 +133,8 @@
         ;; Clone to get/reuse an nREPL session
         existing-sid (get-in session-config [:internal :session-id])
         session-id (if existing-sid
-                     ;; Verify existing session is still valid
+                     ;; Reuse existing session ID; if the server was restarted externally,
+                     ;; the next eval will fail and the user should run `replsh restart`.
                      existing-sid
                      ;; Create new session via clone
                      (let [msg-id (send-msg handles {"op" "clone"})

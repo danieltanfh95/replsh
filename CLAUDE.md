@@ -48,10 +48,10 @@ replsh output --eval-id <id>
 
 ```bash
 # Unit tests only (streaming shows progress)
-replsh eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :unit-only? true)' --timeout 60000
+replsh eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :unit-only? true :reload? true)' --timeout 60000
 
 # All tests (unit + integration)
-replsh eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all)' --timeout 120000
+replsh eval --name dev --stream '(require (quote [replsh.test-runner])) (replsh.test-runner/run-all :reload? true)' --timeout 120000
 ```
 
 **Or run tests directly** (cold start, simpler):

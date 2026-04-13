@@ -76,8 +76,7 @@
   "Poll an HTTP endpoint until it responds with 2xx. Checks process liveness.
    Returns true on success. Throws on timeout or process death."
   [{:keys [url timeout-ms process]}]
-  (let [deadline (+ (System/currentTimeMillis) (or timeout-ms 30000))
-]
+  (let [deadline (+ (System/currentTimeMillis) (or timeout-ms 30000))]
     (loop []
       (when (and process (not (.isAlive ^Process process)))
         (throw (ex-info "Process exited before HTTP endpoint became available"
