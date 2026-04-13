@@ -1,10 +1,12 @@
 (ns replsh.integration-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [replsh.command :as cmd]
             [replsh.state :as state]
-            [replsh.process :as process])
+            [replsh.process :as process]
+            [replsh.watch :as watch])
   (:import [java.io File]))
 
 ;; Use a temp state file so tests don't pollute real state
@@ -272,6 +274,36 @@
       (is (= real-tmp (get-in session [:env :cwd]))
           "session :env :cwd should reflect what the runtime reports, not CLI input")
       (cmd/stop-cmd {:name "itest-probe"}))))
+
+(deftest stale-detection-test
+  (testing "stale files are detected after source file mtime changes"
+    (let [util-file (io/file "src/replsh/util.clj")]
+      ;; Only run if the source file exists (i.e., running from project root)
+      (when (.exists util-file)
+        (let [_ (cmd/launch-cmd (merge base-launch-opts
+                                       {:name "itest-stale"
+                                        :port 16686
+                                        :cmd  "bb --nrepl-server 16686"
+                                        :cwd  (System/getProperty "user.dir")}))]
+          (try
+            ;; With idle threshold = 0, every eval triggers stale detection.
+            (with-redefs [watch/idle-threshold-ms (constantly 0)]
+              ;; First eval: establishes baseline mtimes (no stale yet since no prior baseline)
+              (let [r1 (cmd/eval-cmd {:name    "itest-stale"
+                                      :code    "(require '[replsh.util])"
+                                      :timeout 10000})]
+                (is (true? (:ok r1)) "require should succeed")
+                (is (nil? (get-in r1 [:data :stale])) "no stale on first check (baseline only)"))
+              ;; Touch the source file to advance its mtime
+              (.setLastModified util-file (System/currentTimeMillis))
+              ;; Second eval: should detect the changed mtime
+              (let [r2 (cmd/eval-cmd {:name    "itest-stale"
+                                      :code    "(+ 1 1)"
+                                      :timeout 10000})]
+                (is (true? (:ok r2)) "eval should succeed")
+                (is (seq (get-in r2 [:data :stale])) "stale files should be reported after mtime change")))
+            (finally
+              (cmd/stop-cmd {:name "itest-stale"}))))))))
 
 ;; --- bbin install smoke tests ---
 ;; These shell out to the actual installed binary to verify end-to-end behavior.

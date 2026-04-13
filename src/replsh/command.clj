@@ -14,9 +14,11 @@
             [replsh.watch :as watch]
             [cheshire.core :as json]
             [clojure.edn :as edn]
-            [clojure.string :as str])
-  (:import [java.io File]
-           [java.lang ProcessBuilder$Redirect]))
+            [clojure.string :as str]
+            [edamame.core :as edamame])
+  (:import [java.io File RandomAccessFile]
+           [java.lang ProcessBuilder$Redirect]
+           [java.nio.charset StandardCharsets]))
 
 ;; Forward declaration: stop-cmd is defined after launch-cmd but
 ;; launch-cmd's --force branch needs to call it.
@@ -409,9 +411,19 @@
       (when hard-expired?
         (try (backend/interrupt! live-state) (catch Exception _)))
       ;; Update internal state (e.g., nREPL ns may have changed)
-      (let [new-session (cond-> (assoc session :internal (:internal live-state))
-                          true                           (assoc :last-eval-at (System/currentTimeMillis))
-                          (:loaded-mtimes detect-result) (assoc :loaded-mtimes (:loaded-mtimes detect-result)))]
+      (let [eval-status   (cond
+                            hard-expired? "timeout"
+                            timed-out?    "partial"
+                            (some #(= :error (:type %)) chunks) "error"
+                            :else "complete")
+            history-entry {:code   code
+                           :ts     (System/currentTimeMillis)
+                           :status eval-status}
+            new-session   (-> (cond-> (assoc session :internal (:internal live-state))
+                                true                           (assoc :last-eval-at (System/currentTimeMillis))
+                                (:loaded-mtimes detect-result) (assoc :loaded-mtimes (:loaded-mtimes detect-result)))
+                              (update :history
+                                      (fn [h] (vec (take-last 100 (conj (or h []) history-entry))))))]
         (backend/close! live-state)
         (state/put-session! state new-session)
         (let [clean-chunks (mapv #(select-keys % [:type :content :stream :meta]) chunks)
@@ -515,7 +527,7 @@
 
 (defn restart-cmd
   "Restart a named session (destroy + re-open)."
-  [{:keys [name]}]
+  [{:keys [name timeout]}]
   (let [state   (state/load-state)
         session (state/get-session state name)]
     (when-not session
@@ -604,12 +616,12 @@
                 (runtime/wait-ready! runtime-info
                                      {:host (get-in session [:transport :host])
                                       :port host-port
-                                      :timeout-ms 30000
+                                      :timeout-ms (or timeout 30000)
                                       :check :tcp})
                 :jupyter
                 (runtime/wait-ready! runtime-info
                                      {:url (get-in session [:transport :url])
-                                      :timeout-ms 30000
+                                      :timeout-ms (or timeout 30000)
                                       :check :http}))
               (let [;; Update transport with discovered port
                     session (if (not= host-port (get-in session [:transport :port]))
@@ -740,6 +752,18 @@
 (def ^:private evals-dir
   (str (System/getProperty "user.home") "/.replsh/evals/"))
 
+(defn- find-replsh-binary
+  "Resolve the replsh entry point. Returns a vector of command args.
+   Prefers the installed `replsh` binary; falls back to `bb -m replsh.main`."
+  []
+  (try
+    (let [pb  (ProcessBuilder. ["which" "replsh"])
+          p   (.start pb)
+          out (str/trim (slurp (.getInputStream p)))]
+      (.waitFor p)
+      (if (seq out) [out] ["bb" "-m" "replsh.main"]))
+    (catch Exception _ ["bb" "-m" "replsh.main"])))
+
 (defn- ensure-evals-dir! []
   (.mkdirs (File. evals-dir)))
 
@@ -757,11 +781,11 @@
                     :status     :running
                     :started-at (util/timestamp)}
         _          (spit meta-file (pr-str meta-data))
-        cmd-args   (cond-> ["bb" "-m" "replsh.main"
-                            "eval" "--name" name
-                            "--stream"
-                            "--file" code-file
-                            "--bg-child" eval-id]
+        cmd-args   (cond-> (into (find-replsh-binary)
+                                 ["eval" "--name" name
+                                  "--stream"
+                                  "--file" code-file
+                                  "--bg-child" eval-id])
                      chunked?
                      (into ["--chunked"])
                      (and timeout (pos? timeout))
@@ -804,13 +828,21 @@
       (throw (ex-info (str "Eval not found: " eval-id)
                       {:code :eval-not-found})))
     (if follow
-      ;; Follow mode: tail jsonl, emit chunks until done
-      (loop [emitted 0]
-        (let [fresh-meta (edn/read-string (slurp meta-file))
-              lines      (when (.exists (File. jsonl-file))
-                           (remove str/blank? (str/split-lines (slurp jsonl-file))))
-              new-lines  (drop emitted lines)
-              parsed     (mapv #(json/parse-string % true) new-lines)
+      ;; Follow mode: tail jsonl from last byte offset (efficient seek-based approach)
+      (loop [emitted 0 byte-pos 0]
+        (let [fresh-meta   (edn/read-string (slurp meta-file))
+              f            (File. jsonl-file)
+              file-len     (when (.exists f) (.length f))
+              new-content  (when (and file-len (> file-len byte-pos))
+                             (with-open [raf (RandomAccessFile. f "r")]
+                               (.seek raf byte-pos)
+                               (let [buf (byte-array (- file-len byte-pos))]
+                                 (.readFully raf buf)
+                                 (String. buf StandardCharsets/UTF_8))))
+              new-lines    (when new-content
+                             (remove str/blank? (str/split-lines new-content)))
+              new-byte-pos (or file-len byte-pos)
+              parsed       (mapv #(json/parse-string % true) (or new-lines []))
               summary-line (first (filter :ok parsed))
               chunks       (vec (remove :ok parsed))]
           (doseq [c chunks] (output/emit-chunk! c))
@@ -826,7 +858,7 @@
               ;; Still running — wait and poll
               (do
                 (Thread/sleep 200)
-                (recur (+ emitted (count chunks))))))))
+                (recur (+ emitted (count chunks)) new-byte-pos))))))
       ;; Non-follow: dump all at once
       (let [meta-data (edn/read-string (slurp meta-file))
             lines     (when (.exists (File. jsonl-file))
@@ -949,3 +981,53 @@
           (output/success :logs {:name    sname
                                  :lines   (count lines)
                                  :content (str/join "\n" lines)}))))))
+
+;; --- History ---
+
+(defn history-cmd
+  "Show recent eval history for a session."
+  [{:keys [name format]}]
+  (let [state   (state/load-state)
+        session (state/get-session state name)]
+    (when-not session
+      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
+                      {:code :session-not-found})))
+    (let [history (or (:history session) [])]
+      (if (= format "script")
+        ;; Script format: one form per line, separated by blank line
+        (do (println (str/join "\n\n" (map :code history))) nil)
+        ;; Default: structured JSON
+        (output/success :history {:name    (:name session)
+                                   :history history})))))
+
+;; --- Replay ---
+
+(defn- split-forms
+  "Split code into a sequence of individual forms for the given backend."
+  [backend code]
+  (case backend
+    :nrepl   (mapv pr-str
+                   (edamame/parse-string-all code {:all true :read-cond :allow :eof nil}))
+    :python  (str/split code #"\n# ---\n")
+    :jupyter (str/split code #"\n# ---\n")
+    :node    (str/split code #"\n// ---\n")
+    [code]))
+
+(defn replay-cmd
+  "Send each top-level form from code to a session sequentially, collecting per-form results."
+  [{:keys [name code timeout hard-timeout]}]
+  (let [state   (state/load-state)
+        session (state/get-session state name)]
+    (when-not session
+      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
+                      {:code :session-not-found})))
+    (let [forms   (split-forms (:backend session) code)
+          results (mapv (fn [form]
+                          (eval-cmd {:name         name
+                                     :code         form
+                                     :timeout      timeout
+                                     :hard-timeout hard-timeout}))
+                        forms)]
+      (output/success :replay {:name    name
+                                :forms   (count forms)
+                                :results results}))))

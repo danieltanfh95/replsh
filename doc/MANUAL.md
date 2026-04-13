@@ -154,7 +154,7 @@ echo '<code>' | replsh eval --name <name>
 
 By default, `--timeout` is 30000ms (30 seconds). When the soft timeout fires:
 
-- Accumulated output (stdout, values, errors) is returned as a **partial success**: `"partial": true`, exit code 0.
+- Accumulated output (stdout, values, errors) is returned as a **partial success**: `"status": "partial"`, exit code 0.
 - The eval may still be running server-side — replsh simply stops listening.
 
 When `--hard-timeout` fires:
@@ -167,12 +167,12 @@ They compose: `--timeout 5000 --hard-timeout 60000` returns partial output at 5s
 
 #### Streaming
 
-With `--stream`, output is emitted as NDJSON — one JSON line per chunk as it arrives from the backend. The final line is the summary envelope with `"final": true`.
+With `--stream`, output is emitted as NDJSON — one JSON line per chunk as it arrives from the backend. The final line is the summary envelope with `"status": "complete"`.
 
 ```
 {"type":"out","content":"line 1\n","stream":"stdout","meta":{}}
 {"type":"value","content":":done","meta":{"ns":"user"}}
-{"ok":true,"command":"eval","data":{...},"final":true}
+{"ok":true,"command":"eval","status":"complete","data":{...}}
 ```
 
 #### Background eval
@@ -424,8 +424,8 @@ All commands emit exactly one JSON object on stdout.
 {
   "ok": true,
   "command": "eval",
-  "data": {"name": "dev", "chunks": [...]},
-  "partial": true
+  "status": "partial",
+  "data": {"name": "dev", "chunks": [...]}
 }
 ```
 
@@ -452,7 +452,7 @@ NDJSON — one JSON line per chunk, final line is the summary envelope:
 ```
 {"type":"out","content":"hello\n","stream":"stdout","meta":{}}
 {"type":"value","content":"3","meta":{"ns":"user"}}
-{"ok":true,"command":"eval","data":{...},"final":true}
+{"ok":true,"command":"eval","status":"complete","data":{...}}
 ```
 
 ### Chunk types

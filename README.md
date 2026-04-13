@@ -69,7 +69,7 @@ replsh eval --name dev '(my-fn input)'           # 30s default timeout
 replsh eval --name dev '(slow-fn)' --timeout 60000
 ```
 
-If it times out, you get **partial output** (whatever accumulated) as a success with `"partial": true` — not an error. The eval may still run server-side. You never lose output to a timeout.
+If it times out, you get **partial output** (whatever accumulated) as a success with `"status": "partial"` — not an error. The eval may still run server-side. You never lose output to a timeout.
 
 ### Streaming
 
@@ -167,8 +167,8 @@ Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
 All sync commands emit one JSON object. Streaming commands emit NDJSON.
 
 ```json
-{"ok": true, "command": "eval", "data": {"value": "3", "ns": "user", "chunks": [...]}}
-{"ok": true, "command": "eval", "data": {"chunks": [...]}, "partial": true}
+{"ok": true, "command": "eval", "status": "complete", "data": {"value": "3", "ns": "user", "chunks": [...]}}
+{"ok": true, "command": "eval", "status": "partial", "data": {"chunks": [...]}}
 ```
 
 Exit codes: `0` success (including partial), `1` eval error, `2` client error, `3` hard timeout.

@@ -12,7 +12,7 @@
     (is (false? (watch/idle? {:last-eval-at (System/currentTimeMillis)}))))
 
   (testing "eval older than threshold is idle"
-    (let [expired (- (System/currentTimeMillis) (inc watch/idle-threshold-ms))]
+    (let [expired (- (System/currentTimeMillis) (inc (watch/idle-threshold-ms)))]
       (is (true? (watch/idle? {:last-eval-at expired}))))))
 
 (deftest diff-mtimes-test

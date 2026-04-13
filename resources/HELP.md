@@ -239,7 +239,7 @@ replsh start  [backend] --name <n> [--port <p>]
 replsh ls
 replsh status --name <n>
 replsh stop   <n>
-replsh restart <n>
+replsh restart <n> [--timeout <ms>]
 replsh interrupt --name <n>
 
 # Eval
@@ -254,6 +254,12 @@ replsh eval --name <n> '<code>' | --file <path> | stdin
 replsh evals                           # list all background evals
 replsh output --eval-id <id>           # read bg eval output
 replsh output --eval-id <id> --follow  # tail bg eval output
+
+# History and replay
+replsh history --name <n>                       # recent eval history (JSON)
+replsh history --name <n> --format script       # history as a script (one form per line)
+replsh replay --name <n> '<code>'               # eval each top-level form sequentially
+replsh replay --name <n> --file <path>          # replay from file
 
 # Process logs
 replsh logs --name <n>                 # full server log

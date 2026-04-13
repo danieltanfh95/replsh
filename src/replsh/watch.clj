@@ -4,7 +4,12 @@
             [replsh.backend :as backend]
             [replsh.util :as util]))
 
-(def idle-threshold-ms 1800000) ; 30 minutes
+(defn idle-threshold-ms
+  "Returns the idle detection threshold in ms. Defaults to 30 minutes.
+   Override with REPLSH_WATCH_IDLE_MS environment variable (for testing)."
+  []
+  (or (some-> (System/getenv "REPLSH_WATCH_IDLE_MS") Long/parseLong)
+      (* 30 60 1000)))
 
 (defn idle?
   "Returns true if session has been idle for more than idle-threshold-ms,
@@ -12,7 +17,7 @@
   [session]
   (let [last-eval-at (:last-eval-at session)]
     (if last-eval-at
-      (> (- (System/currentTimeMillis) last-eval-at) idle-threshold-ms)
+      (> (- (System/currentTimeMillis) last-eval-at) (idle-threshold-ms))
       true)))
 
 (defn introspection-code

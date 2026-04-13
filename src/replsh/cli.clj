@@ -219,7 +219,8 @@
 (defn- restart-handler
   [{:keys [opts args]}]
   (let [name (or (first args) (:name opts))]
-    (cmd/restart-cmd {:name name})))
+    (cmd/restart-cmd {:name    name
+                      :timeout (:timeout opts)})))
 
 (defn- status-handler
   [{:keys [opts]}]
@@ -243,6 +244,27 @@
   (cmd/logs-cmd {:name   (:name opts)
                   :tail   (:tail opts)
                   :follow (:follow opts)}))
+
+(defn- history-handler
+  [{:keys [opts]}]
+  (cmd/history-cmd {:name   (:name opts)
+                    :format (:format opts)}))
+
+(defn- replay-handler
+  [{:keys [opts args]}]
+  (let [file (:file opts)
+        code (cond
+               file          (slurp file)
+               (first args)  (first args)
+               :else         (let [input (slurp *in*)]
+                               (when (empty? input)
+                                 (throw (ex-info "No code provided (pass as argument, --file, or pipe to stdin)"
+                                                 {:code :missing-arg})))
+                               input))]
+    (cmd/replay-cmd {:name         (:name opts)
+                     :code         code
+                     :timeout      (:timeout opts)
+                     :hard-timeout (:hard-timeout opts)})))
 
 (def ^:private base-spec
   {:name      {:alias :n :desc "Session name"}
@@ -307,7 +329,8 @@
    {:cmds ["stop"]             :fn stop-handler
     :spec {:name {:alias :n :desc "Session name"}}}
    {:cmds ["restart"]          :fn restart-handler
-    :spec {:name {:alias :n :desc "Session name"}}}
+    :spec {:name    {:alias :n :desc "Session name"}
+           :timeout {:alias :t :desc "Port readiness timeout in ms" :coerce :long}}}
    {:cmds ["status"]           :fn status-handler
     :spec {:name {:alias :n :desc "Session name"}}}
    {:cmds ["interrupt"]        :fn interrupt-handler
@@ -317,6 +340,14 @@
            :follow  {:alias :f :desc "Tail output until eval completes" :coerce :boolean :default false}}}
    {:cmds ["evals"]            :fn evals-handler}
    {:cmds ["toolchains"]       :fn toolchains-handler}
+   {:cmds ["history"]          :fn history-handler
+    :spec {:name   {:alias :n :desc "Session name"}
+           :format {:desc "Output format: json (default) or script" :coerce :string}}}
+   {:cmds ["replay"]           :fn replay-handler
+    :spec {:name         {:alias :n :desc "Session name"}
+           :file         {:alias :f :desc "Read code from file" :coerce :string}
+           :timeout      {:alias :t :desc "Soft timeout per form in ms" :coerce :long :default 30000}
+           :hard-timeout {:desc "Hard timeout per form in ms" :coerce :long}}}
    {:cmds ["logs"]             :fn logs-handler
     :spec {:name   {:alias :n :desc "Session name"}
            :tail   {:alias :t :desc "Show last N lines" :coerce :long}
