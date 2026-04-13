@@ -117,27 +117,28 @@ CLI: replsh launch nrepl --name dev --cmd "bb --nrepl-server {port}"
 ## Data Flow: launch (exec mode)
 
 ```
-CLI: replsh launch python --name api --container my-flask-app
+CLI: replsh launch python --name api --ssh-host my-machine --container my-app
 
  cli.clj: launch-handler
-  │  exec-mode? → true (--container present, no --cmd)
+  │  exec-mode? → true (--ssh-host or --container present, no --cmd)
   │
   ▼
  command.clj: launch-exec-cmd!
   │
-  │  ┌─ Verify container running: runtime/alive? {:runtime :docker ...}
-  │  │    or spawn new container: runtime/spawn! with :cmd nil
-  │  │    (nil cmd → no --entrypoint override → image's default runs)
+  │  ┌─ Verify container running: runtime/alive? {:runtime :exec :ssh-host ... :container-id ...}
+  │  │    runs: ssh <host> docker inspect --format '{{.State.Running}}' <container>
+  │  │    or spawn new container: runtime/spawn! with :image
   │  │
-  │  ├─ runtime/deploy-bridge!
+  │  ├─ runtime/deploy-bridge!  {:runtime :exec ...}
   │  │    bridge/ensure-bridge! → ~/.replsh/bridge/replsh_bridge.py
-  │  │    docker exec mkdir -p /tmp/replsh
-  │  │    docker cp bridge.py <container>:/tmp/replsh/replsh_bridge.py
+  │  │    pipes bridge via stdin: ssh <host> "docker exec -i <container> sh -c 'cat > /tmp/...'"
+  │  │    (SSH-only: ssh <host> "mkdir -p /tmp/... && cat > /tmp/..."
+  │  │     Docker-only: docker exec -i <container> sh -c 'cat > /tmp/...')
   │  │
   │  ├─ runtime/exec! ──► start persistent bridge server
-  │  │    docker exec -i <container> python3 /tmp/replsh/replsh_bridge.py --port 9876
+  │  │    exec-args dispatches: ssh <host> "docker exec -i <container> sh -c python3 ..."
   │  │    returns {:in BufferedReader :out PrintWriter :process Process}
-  │  │    host-side Process wraps bridge lifecycle
+  │  │    host-side Process PID stored as :bridge-pid
   │  │
   │  ├─ Verify via temporary proxy:
   │  │    runtime/exec! → python3 bridge.py --connect 127.0.0.1:9876
@@ -146,10 +147,10 @@ CLI: replsh launch python --name api --container my-flask-app
   │  ├─ backend/open! ──► full eval connectivity check
   │  ├─ run-init! ──► execute --init code if present
   │  ├─ backend/close!
-  │  └─ state/put-session! ──► persist with :transport {:type :exec ...}
+  │  └─ state/put-session! ──► persist with :runtime :exec :transport {:type :exec ...}
   │
   ▼
- output/success {:name "api" :mode "exec" :container-id "my-flask-app" :owned false}
+ output/success {:name "api" :runtime "exec" :container-id "my-app" :ssh-host "my-machine" :owned false}
 ```
 
 ## Data Shapes
@@ -159,7 +160,7 @@ CLI: replsh launch python --name api --container my-flask-app
 ```clojure
 {:name         "dev"
  :backend      :nrepl              ; dispatch key for backend/*
- :runtime      :local              ; dispatch key for runtime/*  (:local | :docker)
+ :runtime      :local              ; dispatch key for runtime/*  (:local | :docker | :exec)
  :created-at   "2026-04-09T..."
  :transport    {:type :tcp         ; :tcp | :http | :exec
                 :host "localhost"
@@ -168,10 +169,11 @@ CLI: replsh launch python --name api --container my-flask-app
  :launch       {:cmd "bb --nrepl-server 1667"    ; port/exec mode
                 :cwd "/project"
                 :pid 12345                       ; local only
-                :container-id "abc..."           ; docker only
-                :bridge-pid 54321                ; exec mode only
-                :bridge-path "/tmp/replsh/..."   ; exec mode only
-                :owned true}                     ; exec mode only
+                :container-id "abc..."           ; docker / exec runtime
+                :ssh-host "my-machine"           ; exec runtime only (optional)
+                :bridge-pid 54321                ; exec runtime only
+                :bridge-path "/tmp/replsh/..."   ; exec runtime only
+                :owned true}                     ; exec runtime only
  :backend-opts {:kernel-name "python3"}          ; jupyter only
  :internal     {:session-id "abc"}               ; backend-specific state
  :init-code    "(require '[my.app])"}            ; optional
@@ -255,13 +257,18 @@ The Python backend supports two transport modes, selected by `:transport :type`:
 ```
 Port mode (:tcp)                        Exec mode (:exec)
 ─────────────────                       ──────────────────
-Host opens TCP socket to bridge         Host opens docker exec -i proxy
-  ┌──────┐    TCP    ┌────────┐          ┌──────┐  stdin/out  ┌───────┐  TCP  ┌────────┐
-  │Client├───────────┤ Bridge │          │Client├─────────────┤ Proxy ├───────┤ Bridge │
-  └──────┘           └────────┘          └──────┘             └───────┘       └────────┘
-                                          host side            container      container
+Host opens TCP socket to bridge         Host opens ephemeral proxy (ssh / docker exec -i / both)
+  ┌──────┐    TCP    ┌────────┐          ┌──────┐  stdin/out  ┌────────────┐  TCP  ┌────────┐
+  │Client├───────────┤ Bridge │          │Client├─────────────┤ ssh+docker ├───────┤ Bridge │
+  └──────┘           └────────┘          └──────┘             └────────────┘       └────────┘
+                                          host side           proxy (ephemeral)    container
 Bridge IS the container entrypoint       Bridge runs alongside the service
 Port exposed to host via -p              No port exposure; proxy is ephemeral
+
+Exec command composition (exec-args):
+  container only  → docker exec -i <container> sh -c <cmd>
+  ssh only        → ssh <host> sh -c <cmd>
+  ssh + container → ssh <host> docker exec -i <container> sh -c <cmd>
 ```
 
 ## File Layout
@@ -274,7 +281,7 @@ src/replsh/
 ├── config.clj           Toolchain presets, 4-layer merge resolution
 ├── state.clj            Flat-file session persistence (~/.replsh/state.edn)
 ├── output.clj           JSON envelope formatting, NDJSON streaming
-├── runtime.clj          Runtime multimethods (:local, :docker)
+├── runtime.clj          Runtime multimethods (:local, :docker, :exec)
 ├── process.clj          Local PID management (spawn, kill, wait)
 ├── bridge.clj           Python bridge deployment to ~/.replsh/bridge/
 ├── util.clj             IDs, port allocation, address parsing

@@ -7,7 +7,8 @@
             [replsh.runtime-test]
             [replsh.watch-test]
             [replsh.process-test]
-            [replsh.integration-test]))
+            [replsh.integration-test]
+            [replsh.ssh-exec-test]))
 
 (defn run-all
   "Run tests and return result map. Safe to call from a live REPL."
@@ -19,7 +20,8 @@
                             'replsh.runtime-test
                             'replsh.watch-test]
                    (not unit-only?) (into ['replsh.process-test
-                                           'replsh.integration-test]))]
+                                           'replsh.integration-test
+                                           'replsh.ssh-exec-test]))]
     (when reload?
       (doseq [ns-sym namespaces]
         (require ns-sym :reload-all)))

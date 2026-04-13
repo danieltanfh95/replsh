@@ -273,31 +273,36 @@
 (defn launch-exec-cmd!
   "Launch exec-mode session: inject REPL bridge into existing/new container.
    The bridge runs persistently inside the container; each eval opens an ephemeral proxy."
-  [{:keys [backend-type name container image env volumes platform init timeout exec-port]}]
+  [{:keys [backend-type name ssh-host container image env volumes platform init timeout exec-port]}]
   (let [exec-port    (or exec-port 9876)
         owned?       (boolean image)  ;; --image without --cmd → owned container
         ;; Step 1: Verify or spawn container
         container-id (if container
                        ;; Existing container — verify it's running
                        (do
-                         (when-not (runtime/alive? {:runtime :docker :container-id container})
+                         (when-not (runtime/alive? (cond-> {:runtime :exec :container-id container}
+                                                     ssh-host (assoc :ssh-host ssh-host)))
                            (throw (ex-info (str "Container not running: " container)
                                            {:code :container-not-running :container container})))
                          container)
                        ;; New container — spawn with image's default entrypoint
-                       (let [runtime-info (runtime/spawn!
-                                            (cond-> {:runtime :docker :cmd nil :name name :image image}
-                                              (seq volumes)  (assoc :volumes volumes)
-                                              (seq env)      (assoc :env-vars env)
-                                              platform       (assoc :platform platform)))]
-                         ;; Wait for the container to be running
-                         (Thread/sleep 1000)
-                         (when-not (runtime/alive? runtime-info)
-                           (runtime/stop! runtime-info)
-                           (throw (ex-info "Container exited immediately"
-                                           {:code :launch-failed :image image})))
-                         (:container-id runtime-info)))
-        runtime-info {:runtime :docker :container-id container-id :name name}]
+                       (when image
+                         (let [runtime-info (runtime/spawn!
+                                              (cond-> {:runtime :exec :name name :image image}
+                                                ssh-host       (assoc :ssh-host ssh-host)
+                                                (seq volumes)  (assoc :volumes volumes)
+                                                (seq env)      (assoc :env-vars env)
+                                                platform       (assoc :platform platform)))]
+                           ;; Wait for the container to be running
+                           (Thread/sleep 1000)
+                           (when-not (runtime/alive? runtime-info)
+                             (runtime/stop! runtime-info)
+                             (throw (ex-info "Container exited immediately"
+                                             {:code :launch-failed :image image})))
+                           (:container-id runtime-info))))
+        runtime-info (cond-> {:runtime :exec :name name}
+                       ssh-host     (assoc :ssh-host ssh-host)
+                       container-id (assoc :container-id container-id))]
     (try
       ;; Step 2: Deploy bridge into container
       (let [bridge-path (runtime/deploy-bridge! runtime-info)
@@ -337,16 +342,17 @@
         (let [bridge-pid (.pid ^Process (:process bridge-proc))
               session-config {:name         name
                               :backend      backend-type
-                              :runtime      :docker
+                              :runtime      :exec
                               :created-at   (util/timestamp)
                               :transport    {:type :exec :exec-port exec-port}
                               :env          {:cwd  (System/getProperty "user.dir")
                                              :vars (or env {})}
-                              :launch       {:container-id container-id
-                                             :bridge-pid   bridge-pid
-                                             :bridge-path  bridge-path
-                                             :exec-cmd     bridge-cmd
-                                             :owned        owned?}
+                              :launch       (cond-> {:container-id container-id
+                                                     :bridge-pid   bridge-pid
+                                                     :bridge-path  bridge-path
+                                                     :exec-cmd     bridge-cmd
+                                                     :owned        owned?}
+                                              ssh-host (assoc :ssh-host ssh-host))
                               :backend-opts {}
                               :internal     {}}
               session-config (cond-> session-config
@@ -368,7 +374,7 @@
           (state/put-session! state session-config)
           (output/success :launch {:name         name
                                    :backend      (clojure.core/name backend-type)
-                                   :runtime      "docker"
+                                   :runtime      "exec"
                                    :mode         "exec"
                                    :container-id container-id
                                    :owned        owned?
@@ -539,7 +545,7 @@
       (let [bridge-pid   (get-in session [:launch :bridge-pid])
             container-id (get-in session [:launch :container-id])
             exec-port    (get-in session [:transport :exec-port])
-            runtime-info {:runtime :docker :container-id container-id :name name}]
+            runtime-info (-> (runtime/session->runtime-info session) (assoc :name name))]
         ;; Kill existing bridge
         (when bridge-pid
           (try (process/kill! bridge-pid) (catch Exception _)))
@@ -583,7 +589,7 @@
             (state/put-session! state new-session)
             (output/success :restart {:name         name
                                       :backend      (clojure.core/name (:backend session))
-                                      :runtime      "docker"
+                                      :runtime      "exec"
                                       :mode         "exec"
                                       :container-id container-id}))))
 

@@ -100,7 +100,7 @@ Soft timeout (partial output at 5s) + hard timeout (interrupt eval at 60s). `--h
 
 ## Exec Mode (Inject REPL into Containers)
 
-Inject a Python REPL into an existing or project container — without replacing its entrypoint:
+Inject a Python REPL into an existing or project container — without replacing its entrypoint. SSH and Docker are independent, composable layers:
 
 ```bash
 # Into an already-running container
@@ -108,6 +108,12 @@ replsh launch python --name api --container my-flask-app
 
 # Start a container with its default entrypoint, then inject REPL
 replsh launch python --name api --image myapp:latest
+
+# SSH only (remote machine — jump hosts, keys, and ports from ~/.ssh/config)
+replsh launch python --name remote --ssh-host my-machine
+
+# SSH + Docker (local → jumphost → remote Docker host)
+replsh launch python --name remote --ssh-host my-machine --container my-app
 
 # State persists across evals
 replsh eval --name api 'import sys; print(sys.version)'
@@ -118,7 +124,7 @@ replsh eval --name api 'print(x)'   # → 42
 replsh stop api
 ```
 
-The bridge runs persistently inside the container on localhost (no port exposure). Each eval opens an ephemeral proxy via `docker exec -i`.
+The bridge runs persistently inside the container on localhost (no port exposure). Each eval opens an ephemeral proxy via `docker exec -i` or `ssh host docker exec -i`. `--ssh-host` accepts any alias from `~/.ssh/config` — ProxyJump, user, port, and identity file are all read from there.
 
 ## Session Management
 

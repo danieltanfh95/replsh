@@ -33,6 +33,7 @@ replsh launch [backend] --name <name> [options]
 | `--init` | `-i` | Bootstrap code to run after connecting |
 | `--timeout` | `-t` | Port readiness timeout in ms (default: 30000) |
 | `--container` | `-c` | Exec into existing Docker container (exec mode) |
+| `--ssh-host` | | SSH host or `~/.ssh/config` alias — triggers exec mode via SSH |
 | `--exec-port` | | Bridge port inside container, exec mode (default: 9876) |
 | `--kernel` | `-k` | Jupyter kernel name (default: `python3`) |
 | `--token` | | Jupyter auth token |
@@ -45,6 +46,7 @@ replsh launch [backend] --name <name> [options]
 | `--cmd` (with or without `--image`) | Port mode | Bridge replaces container entrypoint, port exposed to host |
 | `--container` (no `--cmd`) | Exec mode | Inject bridge into existing container via `docker exec` |
 | `--image` (no `--cmd`) | Exec mode | Spawn container with default entrypoint, inject bridge |
+| `--ssh-host` (alone or with `--container`) | Exec mode | Inject bridge via SSH; optionally `docker exec` inside remote container |
 
 **Examples:**
 
@@ -71,7 +73,7 @@ replsh launch --name dev --init "(require '[my.app])"
 
 #### Exec mode
 
-Exec mode injects a Python REPL into an existing or project container without replacing its entrypoint. The bridge runs persistently inside the container; each eval opens an ephemeral proxy via `docker exec -i`.
+Exec mode injects a Python REPL into an existing or remote container without replacing its entrypoint. SSH and Docker are independent, composable layers — use either or both:
 
 ```bash
 # Inject REPL into an already-running container
@@ -79,6 +81,12 @@ replsh launch python --name api --container my-flask-app
 
 # Start a container with its default entrypoint, then inject REPL
 replsh launch python --name api --image myapp:latest
+
+# SSH only (remote machine — jump hosts, keys, ports from ~/.ssh/config)
+replsh launch python --name remote --ssh-host my-machine
+
+# SSH + Docker (e.g. local → jumphost → remote Docker host)
+replsh launch python --name remote --ssh-host my-machine --container my-app
 
 # State persists across evals
 replsh eval --name api '1 + 2'        # → 3
@@ -91,10 +99,20 @@ replsh stop api
 
 **How it works:**
 
-1. Bridge is deployed into the container via `docker cp`
-2. A persistent bridge server starts inside the container (`python3 /tmp/replsh/replsh_bridge.py --port 9876`), listening on container-internal localhost only (no port exposure)
-3. Each eval opens an ephemeral proxy (`docker exec -i ... --connect 127.0.0.1:9876`) that relays stdin↔TCP
+1. Bridge is deployed into the target via stdin piping (`cat > /tmp/replsh/replsh_bridge.py`) — through SSH and/or `docker exec -i` as needed
+2. A persistent bridge server starts inside the target (`python3 /tmp/replsh/replsh_bridge.py --port 9876`), listening on localhost only (no port exposure)
+3. Each eval opens an ephemeral proxy that relays stdin↔TCP — the proxy command is composed from whichever of SSH/Docker are set
 4. `replsh stop` kills the bridge; if the container was spawned by replsh (`--image`), it also stops the container
+
+**Exec command composition:**
+
+| `ssh-host` | `container` | Exec command |
+|-----------|-------------|--------------|
+| — | ✓ | `docker exec -i <container> sh -c <cmd>` |
+| ✓ | — | `ssh <host> sh -c <cmd>` |
+| ✓ | ✓ | `ssh <host> docker exec -i <container> sh -c <cmd>` |
+
+`--ssh-host` accepts any alias from `~/.ssh/config`. ProxyJump, user, port, and identity file are all read from SSH config — replsh just passes the name through.
 
 **Owned vs unowned containers:**
 

@@ -144,6 +144,12 @@ replsh launch python --name api --container my-flask-app
 # Start container with its default entrypoint, inject REPL (owned — will stop it)
 replsh launch python --name api --image myapp:latest
 
+# SSH only (remote machine — jump hosts, keys, and ports from ~/.ssh/config)
+replsh launch python --name remote --ssh-host my-machine
+
+# SSH + Docker (e.g. local → jumphost → remote Docker host)
+replsh launch python --name remote --ssh-host my-machine --container my-app
+
 # State persists across evals
 replsh eval --name api 'import flask; print(flask.__version__)'
 replsh eval --name api 'x = 42'
@@ -151,6 +157,8 @@ replsh eval --name api 'print(x)'   # → 42
 
 replsh stop api
 ```
+
+`--ssh-host` accepts any host alias from `~/.ssh/config`. ProxyJump, user, port, and identity file are all read from SSH config — replsh just passes the name through.
 
 ### 4. Eval
 
@@ -233,8 +241,9 @@ replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 ```bash
 # Session lifecycle
 replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>] [--force]
-replsh launch [backend] --name <n> --container <c>   # exec mode: inject into existing container
-replsh launch [backend] --name <n> --image <img>     # exec mode: spawn container, inject REPL
+replsh launch [backend] --name <n> --container <c>                    # exec mode: inject into existing container
+replsh launch [backend] --name <n> --image <img>                      # exec mode: spawn container, inject REPL
+replsh launch [backend] --name <n> --ssh-host <host> [--container <c>]  # exec mode: via SSH
 replsh start  [backend] --name <n> [--port <p>]
 replsh ls
 replsh status --name <n>

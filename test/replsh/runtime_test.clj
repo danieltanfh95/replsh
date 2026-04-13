@@ -6,8 +6,16 @@
   (testing "adds :local runtime to sessions without :runtime"
     (is (= :local (:runtime (runtime/normalize-session {:name "test"})))))
 
-  (testing "preserves existing runtime"
-    (is (= :docker (:runtime (runtime/normalize-session {:name "test" :runtime :docker}))))))
+  (testing "preserves existing :docker runtime (port-mode — no exec transport)"
+    (is (= :docker (:runtime (runtime/normalize-session {:name "test" :runtime :docker})))))
+
+  (testing "migrates :docker exec-mode sessions to :exec runtime"
+    (let [session {:name "api" :runtime :docker
+                   :transport {:type :exec :exec-port 9876}}]
+      (is (= :exec (:runtime (runtime/normalize-session session))))))
+
+  (testing "preserves existing :exec runtime"
+    (is (= :exec (:runtime (runtime/normalize-session {:name "test" :runtime :exec}))))))
 
 (deftest session->runtime-info-test
   (testing "local session extracts pid"
@@ -27,7 +35,26 @@
   (testing "session without runtime defaults to local"
     (let [info (runtime/session->runtime-info
                  {:name "dev" :launch {:pid 999}})]
-      (is (= :local (:runtime info))))))
+      (is (= :local (:runtime info)))))
+
+  (testing "exec session extracts ssh-host, container-id, and bridge-pid"
+    (let [info (runtime/session->runtime-info
+                 {:name "remote" :runtime :exec
+                  :launch {:ssh-host "my-machine" :container-id "my-app"
+                           :bridge-pid 42000}})]
+      (is (= :exec (:runtime info)))
+      (is (= "my-machine" (:ssh-host info)))
+      (is (= "my-app" (:container-id info)))
+      (is (= 42000 (:pid info)))
+      (is (= "remote" (:name info)))))
+
+  (testing "exec session without ssh-host (container-only)"
+    (let [info (runtime/session->runtime-info
+                 {:name "local-docker" :runtime :exec
+                  :launch {:container-id "my-app" :bridge-pid 12345}})]
+      (is (= :exec (:runtime info)))
+      (is (nil? (:ssh-host info)))
+      (is (= "my-app" (:container-id info))))))
 
 (deftest local-mapped-port-test
   (testing "local mapped-port returns same port"
@@ -108,3 +135,32 @@
     (let [path (runtime/deploy-bridge! {:runtime :local})]
       (is (string? path))
       (is (.exists (java.io.File. ^String path))))))
+
+(deftest exec-runtime-test
+  (testing "exec! :exec (local, no ssh, no container) runs command via /bin/sh"
+    (let [handles (runtime/exec! {:runtime :exec :name "test-exec-local"}
+                                 "echo hello-exec" {})]
+      (is (instance? java.io.BufferedReader (:in handles)))
+      (is (instance? java.io.PrintWriter (:out handles)))
+      (is (instance? Process (:process handles)))
+      (let [line (.readLine ^java.io.BufferedReader (:in handles))]
+        (is (= "hello-exec" line)))
+      (.destroy ^Process (:process handles))))
+
+  (testing "alive? :exec with no pid and no container returns false"
+    (is (not (runtime/alive? {:runtime :exec}))))
+
+  (testing "alive? :exec with nonexistent container returns false"
+    (is (not (runtime/alive? {:runtime :exec :container-id "nonexistent-xyz-exec"}))))
+
+  (testing "mapped-port :exec returns same port"
+    (is (= 9876 (runtime/mapped-port {:runtime :exec} 9876))))
+
+  (testing "wait-ready! :exec returns true immediately"
+    (is (true? (runtime/wait-ready! {:runtime :exec} {}))))
+
+  (testing "deploy-files! :exec is a no-op"
+    (is (nil? (runtime/deploy-files! {:runtime :exec} [{:src "/a" :dest "/b"}]))))
+
+  (testing "send-signal! :exec with nil pid does nothing"
+    (is (nil? (runtime/send-signal! {:runtime :exec :pid nil} "INT")))))

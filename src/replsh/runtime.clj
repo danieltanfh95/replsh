@@ -1,6 +1,7 @@
 (ns replsh.runtime
   (:require [replsh.process :as process]
             [babashka.http-client :as http]
+            [clojure.java.io :as io]
             [clojure.string :as str])
   (:import [java.io BufferedReader File InputStreamReader PrintWriter OutputStreamWriter]
            [java.lang ProcessBuilder$Redirect]
@@ -30,7 +31,10 @@
         launch (:launch session)]
     (cond-> {:runtime rt :name (:name session)}
       (= rt :local)  (assoc :pid (:pid launch))
-      (= rt :docker) (assoc :container-id (:container-id launch)))))
+      (= rt :docker) (assoc :container-id (:container-id launch))
+      (= rt :exec)   (assoc :pid          (:bridge-pid launch)
+                            :ssh-host     (:ssh-host launch)
+                            :container-id (:container-id launch)))))
 
 ;; --- Docker CLI helpers ---
 
@@ -61,11 +65,15 @@
 ;; --- Session normalization ---
 
 (defn normalize-session
-  "Ensure a session config has :runtime set (defaults to :local)."
+  "Ensure a session config has :runtime set (defaults to :local).
+   Also migrates old :docker exec-mode sessions to the unified :exec runtime."
   [session]
-  (if (:runtime session)
-    session
-    (assoc session :runtime :local)))
+  (cond-> session
+    (not (:runtime session))
+    (assoc :runtime :local)
+    (and (= :docker (:runtime session))
+         (= :exec (get-in session [:transport :type])))
+    (assoc :runtime :exec)))
 
 ;; ==========================================================================
 ;; :local runtime — delegates to existing process.clj
@@ -255,3 +263,124 @@
     (run-docker! "exec" container-id "mkdir" "-p" "/tmp/replsh")
     (run-docker! "cp" host-path (str container-id ":" dest-path))
     dest-path))
+
+;; ==========================================================================
+;; :exec runtime — bridge via SSH and/or Docker exec (compose as needed)
+;; ==========================================================================
+
+(defn- shell-escape
+  "Wrap a string in single quotes, escaping any embedded single quotes."
+  [s]
+  (str "'" (str/replace s "'" "'\\''") "'"))
+
+(defn- exec-args
+  "Build a ProcessBuilder args vector for the given exec combination.
+   ssh-host and container-id are both optional."
+  [{:keys [ssh-host container-id]} cmd]
+  (cond
+    (and ssh-host container-id)
+    ["ssh" "-o" "BatchMode=yes" ssh-host
+     (str "docker exec -i " container-id " sh -c " (shell-escape cmd))]
+
+    ssh-host
+    ["ssh" "-o" "BatchMode=yes" ssh-host (str "sh -c " (shell-escape cmd))]
+
+    container-id
+    ["docker" "exec" "-i" container-id "sh" "-c" cmd]
+
+    :else
+    ["/bin/sh" "-c" cmd]))
+
+(defmethod exec! :exec
+  [{:keys [name] :as runtime-info} cmd _opts]
+  (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
+        _        (.mkdirs (File. log-dir))
+        log-file (File. (str log-dir (or name "exec") ".exec.log"))
+        pb       (doto (ProcessBuilder. ^java.util.List (exec-args runtime-info cmd))
+                   (.redirectError (ProcessBuilder$Redirect/appendTo log-file)))
+        process  (.start pb)]
+    {:in  (BufferedReader. (InputStreamReader. (.getInputStream process) StandardCharsets/UTF_8))
+     :out (PrintWriter. (OutputStreamWriter. (.getOutputStream process) StandardCharsets/UTF_8) true)
+     :process process}))
+
+(defmethod deploy-bridge! :exec [{:keys [ssh-host container-id]}]
+  (require 'replsh.bridge)
+  (let [local-path  ((resolve 'replsh.bridge/ensure-bridge!))
+        remote-path "/tmp/replsh/replsh_bridge.py"
+        dest-cmd    (if container-id
+                      (str "docker exec -i " container-id
+                           " sh -c 'mkdir -p /tmp/replsh && cat > " remote-path "'")
+                      (str "mkdir -p /tmp/replsh && cat > " remote-path))
+        args        (if ssh-host
+                      ["ssh" "-o" "BatchMode=yes" ssh-host dest-cmd]
+                      ["/bin/sh" "-c" dest-cmd])
+        pb          (ProcessBuilder. ^java.util.List args)
+        process     (.start pb)]
+    (let [proc-out (.getOutputStream process)]
+      (io/copy (io/file local-path) proc-out)
+      (.flush proc-out)
+      (.close proc-out))
+    (when-not (zero? (.waitFor process))
+      (throw (ex-info "Failed to deploy bridge" {:code :deploy-failed})))
+    remote-path))
+
+(defmethod alive? :exec [{:keys [pid ssh-host container-id]}]
+  (cond
+    container-id
+    (try
+      (let [inspect-cmd (str "docker inspect --format '{{.State.Running}}' " container-id)
+            args        (if ssh-host
+                          ["ssh" "-o" "BatchMode=yes" ssh-host inspect-cmd]
+                          ["/bin/sh" "-c" inspect-cmd])
+            proc        (-> (ProcessBuilder. ^java.util.List args) .start)
+            out         (str/trim (slurp (.getInputStream proc)))]
+        (.waitFor proc)
+        (= out "true"))
+      (catch Exception _ false))
+    pid (process/alive? pid)
+    :else false))
+
+(defmethod stop! :exec [{:keys [ssh-host container-id]}]
+  (when container-id
+    (let [stop-cmd (str "docker stop " container-id " && docker rm " container-id)
+          args     (if ssh-host
+                     ["ssh" "-o" "BatchMode=yes" ssh-host stop-cmd]
+                     ["/bin/sh" "-c" stop-cmd])]
+      (try (-> (ProcessBuilder. ^java.util.List args) .start .waitFor)
+           (catch Exception _)))))
+
+(defmethod spawn! :exec [{:keys [ssh-host image name env-vars volumes platform]}]
+  (let [cname       (str "replsh-" name)
+        docker-args (cond-> ["docker" "run" "-d" "--name" cname]
+                      platform       (into ["--platform" platform])
+                      (seq volumes)  (into (mapcat (fn [v] ["-v" v]) volumes))
+                      (seq env-vars) (into (mapcat (fn [[k v]] ["-e" (str k "=" v)]) env-vars))
+                      true           (conj image))
+        args        (if ssh-host
+                      ["ssh" "-o" "BatchMode=yes" ssh-host
+                       (str/join " " docker-args)]
+                      docker-args)
+        proc        (-> (ProcessBuilder. ^java.util.List args) .start)
+        cid         (str/trim (slurp (.getInputStream proc)))]
+    (.waitFor proc)
+    {:runtime :exec :container-id cid}))
+
+(defmethod send-signal! :exec [{:keys [pid]} signal]
+  (when pid
+    (-> (ProcessBuilder. ["kill" (str "-" signal) (str pid)]) .start .waitFor)))
+
+(defmethod mapped-port :exec [_info port] port)
+
+(defmethod wait-ready! :exec [_info _opts] true)
+
+(defmethod deploy-files! :exec [_info _files] nil)
+
+(defmethod logs :exec [{:keys [name]} {:keys [tail]}]
+  (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
+        log-file (File. (str log-dir (or name "exec") ".exec.log"))]
+    (when (.exists log-file)
+      (let [content (slurp log-file)
+            lines   (str/split-lines content)]
+        (if tail
+          (str/join "\n" (take-last tail lines))
+          content)))))
