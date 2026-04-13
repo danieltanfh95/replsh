@@ -186,7 +186,7 @@ replsh eval --name dev '(+ 1 2)'
 replsh eval --name dev '(long-running-fn)' --timeout 60000
 ```
 
-If the eval completes within `--timeout` (default 30s), you get the full result. If it times out, you get **partial output** — whatever stdout/values accumulated before the deadline — as a success with `"partial": true`. The eval may still be running server-side. This means you never lose output to a timeout.
+If the eval completes within `--timeout` (default 30s), you get the full result with `"status": "complete"`. If it times out, you get **partial output** — whatever stdout/values accumulated before the deadline — as a success with `"status": "partial"`. The eval may still be running server-side. This means you never lose output to a timeout.
 
 Use `--timeout 0` to wait indefinitely (until completion or hard timeout).
 
@@ -196,7 +196,7 @@ Use `--timeout 0` to wait indefinitely (until completion or hard timeout).
 replsh eval --name dev --stream '(doseq [i (range 10)] (println i) (Thread/sleep 500))'
 ```
 
-Output arrives as NDJSON — one JSON line per chunk, streamed in real time. Final line has `"final": true`. Use this when you want to see output as it's produced (test suites, data processing, iterative output).
+Output arrives as NDJSON — one JSON line per chunk, streamed in real time. Each chunk line has `"status": "streaming"`. The final line is the summary envelope with `"status": "complete"` (or `"partial"` on timeout). Use this when you want to see output as it's produced (test suites, data processing, iterative output).
 
 ### Background (`--bg`)
 
@@ -226,7 +226,7 @@ replsh eval --name dev '(expensive-fn)' --timeout 5000 --hard-timeout 60000
 replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 ```
 
-`--hard-timeout` interrupts the eval server-side (nREPL interrupt, Jupyter interrupt, SIGINT for Python/Node). Returns exit code 3. Use when you need to guarantee the eval stops.
+`--hard-timeout` interrupts the eval server-side (nREPL interrupt, Jupyter interrupt, SIGINT for Python/Node). Returns `"status": "partial"` and exit code 3. Use when you need to guarantee the eval stops.
 
 ## Command Reference
 
@@ -247,6 +247,7 @@ replsh eval --name <n> '<code>' | --file <path> | stdin
     [--timeout <ms>]           # soft timeout, default 30s (0 = no limit)
     [--hard-timeout <ms>]      # interrupt eval after this
     [--stream]                 # NDJSON output
+    [--chunked]                # include raw chunks array in output
     [--bg]                     # background eval
 
 # Background eval management
@@ -278,28 +279,29 @@ Backends: `nrepl`, `python`, `jupyter`, `node`. Optional when using project conf
 One JSON object on stdout:
 
 ```json
-{"ok": true, "command": "eval", "data": {"value": "3", "ns": "user", "chunks": [...]}}
-{"ok": true, "command": "eval", "data": {"chunks": [...]}, "partial": true}
-{"ok": false, "command": "eval", "error": {"code": "eval_error", "message": "..."}}
+{"ok": true, "command": "eval", "status": "complete", "data": {"value": "3", "ns": "user"}}
+{"ok": true, "command": "eval", "status": "complete", "data": {"value": "42", "output": "hello\n", "ns": "user"}}
+{"ok": true, "command": "eval", "status": "partial", "data": {"value": "42", "output": "partial stdout..."}}
+{"ok": false, "command": "eval", "status": "complete", "error": {"code": "eval_error", "message": "..."}}
 ```
 
 ### Streaming eval (`--stream`)
 
-NDJSON — one JSON line per chunk, final line is the summary:
+NDJSON — one JSON line per chunk, last line is the summary:
 
 ```
-{"type":"out","content":"hello\n","stream":"stdout","meta":{}}
-{"type":"value","content":"3","meta":{"ns":"user"}}
-{"ok":true,"command":"eval","data":{...},"final":true}
+{"type":"out","content":"hello\n","stream":"stdout","meta":{},"status":"streaming"}
+{"type":"value","content":"3","meta":{"ns":"user"},"status":"streaming"}
+{"ok":true,"command":"eval","status":"complete","data":{"value":"3","ns":"user"}}
 ```
 
 ### Key fields
 
 - `data.value` — return value (string)
 - `data.ns` — current namespace (nREPL)
-- `data.chunks` — all output: `out`, `err`, `value`, `error`, `status`
-- `partial` — true when eval timed out but returned partial output
-- `final` — true on the last line of streaming output
+- `data.output` — joined stdout (only present when non-empty)
+- `status` — `"complete"` (eval finished), `"partial"` (eval timed out), or `"streaming"` (live NDJSON chunk, more coming)
+- `data.chunks` — raw chunk array, only present with `--chunked` flag
 - Exit codes: always 0 by default. With `--exit-on-error`: 0=success, 1=eval error, 2=client error, 3=hard timeout
 
 ## Config

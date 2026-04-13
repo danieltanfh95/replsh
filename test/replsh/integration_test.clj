@@ -57,7 +57,28 @@
                                        :code "(+ 1 2)"
                                        :timeout 10000})]
         (is (true? (:ok eval-result)))
-        (is (= "3" (get-in eval-result [:data :value]))))
+        (is (= "3" (get-in eval-result [:data :value])))
+        (is (= "complete" (:status eval-result)))
+        (is (nil? (get-in eval-result [:data :chunks])) "chunks should not be in default output"))
+
+      ;; Eval with stdout
+      (let [eval-result (cmd/eval-cmd {:name "itest"
+                                       :code "(do (println \"hi\") 42)"
+                                       :timeout 10000})]
+        (is (true? (:ok eval-result)))
+        (is (= "42" (get-in eval-result [:data :value])))
+        (is (= "hi\n" (get-in eval-result [:data :output])))
+        (is (nil? (get-in eval-result [:data :chunks]))))
+
+      ;; Eval with --chunked
+      (let [eval-result (cmd/eval-cmd {:name "itest"
+                                       :code "(do (println \"hi\") 42)"
+                                       :timeout 10000
+                                       :chunked? true})]
+        (is (true? (:ok eval-result)))
+        (is (= "42" (get-in eval-result [:data :value])))
+        (is (= "hi\n" (get-in eval-result [:data :output])))
+        (is (vector? (get-in eval-result [:data :chunks])) "chunks should be present with --chunked"))
 
       ;; Status
       (let [status-result (cmd/status-cmd {:name "itest"})]
@@ -89,7 +110,8 @@
                                        :code "test-var"
                                        :timeout 10000})]
         (is (true? (:ok eval-result)))
-        (is (= "42" (get-in eval-result [:data :value]))))
+        (is (= "42" (get-in eval-result [:data :value])))
+        (is (= "complete" (:status eval-result))))
 
       (cmd/stop-cmd {:name "itest-init"}))))
 

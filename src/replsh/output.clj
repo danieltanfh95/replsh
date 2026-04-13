@@ -28,13 +28,15 @@
 (defn emit-chunk!
   "Print a single chunk as a JSON line to stdout (NDJSON). Flushes immediately."
   [chunk]
-  (println (json/generate-string (select-keys chunk [:type :content :stream :meta])))
+  (println (json/generate-string
+             (assoc (select-keys chunk [:type :content :stream :meta])
+                    :status "streaming")))
   (flush))
 
 (defn emit-summary!
   "Print the final summary envelope as the last NDJSON line. Returns exit code."
   [result]
-  (println (json/generate-string (assoc result :final true)))
+  (println (json/generate-string result))
   (flush)
   (if (:ok result)
     0

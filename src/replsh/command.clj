@@ -377,7 +377,7 @@
 
 (defn eval-cmd
   "Evaluate code in a named session."
-  [{:keys [name code timeout hard-timeout stream?]}]
+  [{:keys [name code timeout hard-timeout stream? chunked?]}]
   (let [state      (state/load-state)
         session    (state/get-session state name)]
     (when-not session
@@ -410,13 +410,20 @@
       (let [new-session (assoc session :internal (:internal live-state))]
         (backend/close! live-state)
         (state/put-session! state new-session)
-        (let [clean-chunks (mapv #(select-keys % [:type :content :stream :meta]) chunks)]
+        (let [clean-chunks (mapv #(select-keys % [:type :content :stream :meta]) chunks)
+              ;; Join stdout for top-level :output field
+              stdout (->> clean-chunks
+                          (filter #(= :out (:type %)))
+                          (map :content)
+                          (str/join))]
           (if hard-expired?
             ;; Hard timeout — return as error (exit code 3)
             (cond-> (output/failure :eval {:code    "timeout"
                                            :message "Hard timeout: eval interrupted"
-                                           :data    {:name   (:name session)
-                                                     :chunks clean-chunks}})
+                                           :data    (cond-> {:name (:name session)}
+                                                     (seq stdout) (assoc :output stdout)
+                                                     chunked?     (assoc :chunks clean-chunks))})
+              true    (assoc :status "partial")
               stream? (assoc :stream? true))
             ;; Normal or soft timeout
             (let [value-chunk (last (filter #(= :value (:type %)) chunks))
@@ -434,16 +441,19 @@
                              (output/failure :eval {:code    "eval_error"
                                                     :message message
                                                     :detail  (:meta err-chunk)
-                                                    :data    {:name   (:name session)
-                                                              :chunks clean-chunks}}))
+                                                    :data    (cond-> {:name (:name session)}
+                                                              (seq stdout) (assoc :output stdout)
+                                                              chunked?     (assoc :chunks clean-chunks))}))
                            (output/success :eval
-                                           (cond-> {:name   (:name session)
-                                                    :chunks clean-chunks}
-                                             value-chunk (assoc :value (:content value-chunk))
+                                           (cond-> {:name (:name session)}
+                                             value-chunk  (assoc :value (:content value-chunk))
+                                             (seq stdout) (assoc :output stdout)
+                                             chunked?     (assoc :chunks clean-chunks)
                                              (get-in value-chunk [:meta :ns]) (assoc :ns (get-in value-chunk [:meta :ns])))))]
               (cond-> result
-                timed-out? (assoc :partial true)
-                stream?    (assoc :stream? true)))))))))
+                (not timed-out?) (assoc :status "complete")
+                timed-out?       (assoc :status "partial")
+                stream?          (assoc :stream? true)))))))))
 
 (defn ls-cmd
   "List all sessions."
@@ -730,7 +740,7 @@
 
 (defn eval-bg-cmd
   "Fork a background eval child process. Returns immediately with eval-id."
-  [{:keys [name code timeout hard-timeout]}]
+  [{:keys [name code timeout hard-timeout chunked?]}]
   (ensure-evals-dir!)
   (let [eval-id    (util/gen-id "eval")
         code-file  (str evals-dir eval-id ".code")
@@ -747,6 +757,8 @@
                             "--stream"
                             "--file" code-file
                             "--bg-child" eval-id]
+                     chunked?
+                     (into ["--chunked"])
                      (and timeout (pos? timeout))
                      (into ["--timeout" (str timeout)])
                      (and hard-timeout (pos? hard-timeout))
@@ -794,12 +806,12 @@
                            (remove str/blank? (str/split-lines (slurp jsonl-file))))
               new-lines  (drop emitted lines)
               parsed     (mapv #(json/parse-string % true) new-lines)
-              final-line (first (filter :final parsed))
-              chunks     (vec (remove :final parsed))]
+              summary-line (first (filter :ok parsed))
+              chunks       (vec (remove :ok parsed))]
           (doseq [c chunks] (output/emit-chunk! c))
-          (if final-line
+          (if summary-line
             ;; Child wrote its summary — re-emit it as our result
-            (assoc (dissoc final-line :final) :stream? true)
+            (assoc summary-line :stream? true)
             (if (#{:completed :failed :timeout} (:status fresh-meta))
               ;; Meta says done but no final line — child crashed
               (cond-> (output/success :output {:eval-id eval-id
@@ -815,15 +827,15 @@
             lines     (when (.exists (File. jsonl-file))
                         (remove str/blank? (str/split-lines (slurp jsonl-file))))
             parsed    (mapv #(json/parse-string % true) lines)
-            final-line (first (filter :final parsed))
-            chunks    (vec (remove :final parsed))]
+            summary-line (first (filter :ok parsed))
+            chunks       (vec (remove :ok parsed))]
         (output/success :output (cond-> {:eval-id    eval-id
                                           :status     (clojure.core/name (:status meta-data))
                                           :session    (:session meta-data)
                                           :started-at (:started-at meta-data)
                                           :ended-at   (:ended-at meta-data)
                                           :chunks     chunks}
-                                  final-line (assoc :summary (dissoc final-line :final))))))))
+                                  summary-line (assoc :summary summary-line)))))))
 
 (defn evals-cmd
   "List all background evals."

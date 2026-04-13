@@ -188,14 +188,16 @@
       (cmd/eval-bg-cmd {:name         (:name opts)
                          :code         code
                          :timeout      (:timeout opts)
-                         :hard-timeout (:hard-timeout opts)})
+                         :hard-timeout (:hard-timeout opts)
+                         :chunked?     (:chunked opts)})
 
       (:bg-child opts)
       (let [result (cmd/eval-cmd {:name         (:name opts)
                                    :code         code
                                    :timeout      (:timeout opts)
                                    :hard-timeout (:hard-timeout opts)
-                                   :stream?      true})]
+                                   :stream?      true
+                                   :chunked?     (:chunked opts)})]
         (cmd/finalize-bg-eval! (:bg-child opts) result)
         result)
 
@@ -204,7 +206,8 @@
                      :code         code
                      :timeout      (:timeout opts)
                      :hard-timeout (:hard-timeout opts)
-                     :stream?      (:stream opts)}))))
+                     :stream?      (:stream opts)
+                     :chunked?     (:chunked opts)}))))
 
 (defn- ls-handler [_] (cmd/ls-cmd))
 
@@ -296,6 +299,7 @@
            :timeout      {:alias :t :desc "Soft timeout in ms (returns partial output)" :coerce :long :default 30000}
            :hard-timeout {:desc "Hard timeout in ms (interrupts eval)" :coerce :long}
            :stream       {:alias :s :desc "Stream output as NDJSON" :coerce :boolean :default false}
+           :chunked      {:desc "Include raw chunks array in output" :coerce :boolean :default false}
            :bg           {:desc "Run eval in background, return eval-id" :coerce :boolean :default false}
            :bg-child     {:desc "Internal: background child mode" :coerce :string}
            :file         {:alias :f :desc "Read code from file (use /dev/stdin for stdin)" :coerce :string}}}
