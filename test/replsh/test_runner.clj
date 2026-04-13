@@ -3,6 +3,7 @@
             [replsh.util-test]
             [replsh.output-test]
             [replsh.config-test]
+            [replsh.cli-test]
             [replsh.runtime-test]
             [replsh.process-test]
             [replsh.integration-test]))
@@ -13,6 +14,7 @@
   (let [namespaces (cond-> ['replsh.util-test
                             'replsh.output-test
                             'replsh.config-test
+                            'replsh.cli-test
                             'replsh.runtime-test]
                    (not unit-only?) (into ['replsh.process-test
                                            'replsh.integration-test]))]

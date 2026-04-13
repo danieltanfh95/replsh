@@ -1,6 +1,7 @@
 (ns replsh.integration-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [cheshire.core :as json]
+            [clojure.string :as str]
             [replsh.command :as cmd]
             [replsh.state :as state]
             [replsh.process :as process])
@@ -249,3 +250,61 @@
       (is (= real-tmp (get-in session [:env :cwd]))
           "session :env :cwd should reflect what the runtime reports, not CLI input")
       (cmd/stop-cmd {:name "itest-probe"}))))
+
+;; --- bbin install smoke tests ---
+;; These shell out to the actual installed binary to verify end-to-end behavior.
+;; They don't use the temp-state fixture (no in-process state needed).
+
+(defn- run-cmd
+  "Run a command and return {:exit int :out string :err string}."
+  [& args]
+  (let [pb (doto (ProcessBuilder. ^java.util.List (vec args))
+             (.directory (File. (System/getProperty "user.dir")))
+             (.redirectErrorStream false))
+        proc (.start pb)
+        out  (slurp (.getInputStream proc))
+        err  (slurp (.getErrorStream proc))
+        exit (.waitFor proc)]
+    {:exit exit :out out :err err}))
+
+(defn- bbin-available? []
+  (try
+    (let [{:keys [exit]} (run-cmd "which" "bbin")]
+      (zero? exit))
+    (catch Exception _ false)))
+
+(deftest bbin-install-smoke-test
+  (if-not (bbin-available?)
+    (println "  SKIP bbin-install-smoke-test: bbin not found on PATH")
+    (do
+      (testing "bbin install succeeds"
+        (let [{:keys [exit err]} (run-cmd "bbin" "install" ".")]
+          (is (zero? exit) (str "bbin install failed: " err))))
+
+      (testing "replsh --help shows full reference (not fallback stub)"
+        (let [{:keys [exit out]} (run-cmd "replsh" "--help")]
+          (is (zero? exit))
+          (is (.contains out "# replsh") "--help should show the HELP.md content")
+          (is (.contains out "Command Reference") "--help should include the full reference")
+          (is (not (.contains out "resource not found")) "--help should not show fallback message")))
+
+      (testing "replsh toolchains returns valid JSON envelope"
+        (let [{:keys [exit out]} (run-cmd "replsh" "toolchains")]
+          (is (zero? exit))
+          (let [parsed (json/parse-string (str/trim out) true)]
+            (is (true? (:ok parsed)))
+            (is (= "toolchains" (:command parsed)))
+            (is (pos? (count (get-in parsed [:data :toolchains])))))))
+
+      (testing "replsh defaults to exit 0 on error"
+        (let [{:keys [exit out]} (run-cmd "replsh" "eval" "--name" "nonexistent" "(+ 1 2)")]
+          (is (zero? exit) "should exit 0 by default even on error")
+          (let [parsed (json/parse-string (str/trim out) true)]
+            (is (false? (:ok parsed))))))
+
+      (testing "replsh --exit-on-error exits non-zero on error"
+        (let [{:keys [exit out]} (run-cmd "replsh" "--exit-on-error" "eval" "--name" "nonexistent" "(+ 1 2)")]
+          (is (= 2 exit) "should exit 2 (client error) with --exit-on-error")
+          (let [parsed (json/parse-string (str/trim out) true)]
+            (is (false? (:ok parsed)))))))))
+

@@ -1,5 +1,6 @@
 (ns replsh.cli
   (:require [babashka.cli :as cli]
+            [clojure.java.io :as io]
             [replsh.command :as cmd]
             [replsh.config :as config]
             [replsh.util :as util]))
@@ -232,6 +233,8 @@
 
 (defn- evals-handler [_] (cmd/evals-cmd))
 
+(defn- toolchains-handler [_] (cmd/toolchains-cmd))
+
 (defn- logs-handler
   [{:keys [opts]}]
   (cmd/logs-cmd {:name   (:name opts)
@@ -309,73 +312,38 @@
     :spec {:eval-id {:alias :e :desc "Background eval ID" :coerce :string :require true}
            :follow  {:alias :f :desc "Tail output until eval completes" :coerce :boolean :default false}}}
    {:cmds ["evals"]            :fn evals-handler}
+   {:cmds ["toolchains"]       :fn toolchains-handler}
    {:cmds ["logs"]             :fn logs-handler
     :spec {:name   {:alias :n :desc "Session name"}
            :tail   {:alias :t :desc "Show last N lines" :coerce :long}
            :follow {:alias :f :desc "Tail log until process exits" :coerce :boolean :default false}}}])
 
-(def ^:private help-text
-  "replsh — Unified CLI for REPL servers
+(defn- load-help-text []
+  (or (some-> (io/resource "HELP.md") slurp)
+      "replsh — run 'replsh --help' for usage (HELP.md resource not found)"))
 
-Usage: replsh <command> [options]
-
-Commands:
-  launch [backend] --name <name>   Spawn a REPL server and connect
-  start  [backend] --name <name>   Connect to an existing REPL server
-  eval   --name <name> '<code>'    Evaluate code in a session
-  eval   --name <name> --file <f>   Evaluate code from file (or stdin)
-  ls                               List all sessions
-  status --name <name>             Show session status
-  stop   <name>                    Stop and remove a session
-  restart <name>                   Restart a session
-  interrupt --name <name>          Interrupt a running eval
-  evals                            List background evals
-  output --eval-id <id>            Read background eval output
-  logs   --name <name>             Read process logs
-
-Backends: nrepl, python, jupyter, node
-
-Launch examples:
-  replsh launch --name backend              # from .replsh/config.edn
-  replsh launch nrepl --name dev --cmd \"bb --nrepl-server {port}\"
-  replsh launch --name ml --init \"import pandas\"
-
-Container examples (port mode — replaces entrypoint):
-  replsh launch nrepl --name dev --cmd \"bb --nrepl-server {port}\" --image babashka/babashka:latest
-  replsh launch --name dev                 # uses clojure.bb.container from config
-
-Exec-mode examples (inject REPL into container):
-  replsh launch python --name api --container my-flask-app
-  replsh launch python --name api --image myapp:latest
-
-Eval examples:
-  replsh eval --name dev '(+ 1 2)'          # inline code
-  replsh eval --name dev --file script.clj  # from file
-  echo '(+ 1 2)' | replsh eval --name dev  # from stdin
-  replsh eval --name dev --bg '(train-model)' # background eval
-  replsh output --eval-id <id>              # read bg output
-  replsh output --eval-id <id> --follow     # tail bg output
-
-Start examples (connect to existing server):
-  replsh start nrepl --name dev --port 1667
-  replsh start --name dev                   # from .replsh/config.edn
-
-Config files:
-  ~/.replsh/config.edn        Global toolchain presets
-  <project>/.replsh/config.edn  Project session definitions
-
-Built-in toolchains: clojure.deps, clojure.lein, clojure.bb,
-                     python, python.poetry, python.venv, node,
-                     clojure.bb.container, clojure.deps.container,
-                     python.container, node.container
-
-All commands emit JSON to stdout. Exit codes: 0=ok, 1=eval error, 2=client error, 3=timeout
-
-Run 'man replsh' or see doc/MANUAL.md for the full reference.")
+(def ^:private skill-frontmatter
+  "---\nname: replsh\ndescription: >\n  A thinking medium for LLM agents. Use the REPL to verify assumptions, inspect\n  runtime state, and test hypotheses — think before you write. Timeouts return\n  partial output (never lose work). Streaming and background eval handle any\n  timescale. Supports Clojure (deps.edn, Leiningen, Babashka), Python (native\n  bridge — zero deps, or Jupyter for rich output), and Node.js. Activate when\n  working on any project with a .replsh/config.edn, or any Clojure/Python/Node\n  project where a REPL would help you understand the code.\nlicense: EPL-2.0\ncompatibility: Requires Babashka (bb) installed. REPL servers started by replsh or running externally.\nmetadata:\n  author: Daniel Tan\n  repository: https://github.com/danieltanfh95/replsh\n---")
 
 (defn dispatch
   [args]
-  (if (or (empty? args)
-          (some #{"--help" "-h" "help"} args))
-    (do (println help-text) nil)
+  (cond
+    (some #{"--install-skill"} args)
+    (let [args-vec  (vec args)
+          path-idx  (.indexOf args-vec "--path")
+          path      (when (and (pos? path-idx) (< (inc path-idx) (count args-vec)))
+                      (nth args-vec (inc path-idx)))
+          dest      (or path "skills/replsh/SKILL.md")
+          help-text (load-help-text)
+          content   (str skill-frontmatter "\n\n" help-text)]
+      (.mkdirs (.getParentFile (io/file dest)))
+      (spit dest content)
+      (println (str "Wrote skill file to " dest))
+      nil)
+
+    (or (empty? args)
+        (some #{"--help" "-h" "help"} args))
+    (do (println (load-help-text)) nil)
+
+    :else
     (cli/dispatch dispatch-table args)))

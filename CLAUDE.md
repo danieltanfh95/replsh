@@ -1,6 +1,6 @@
 # replsh — Development Guide for Claude Code
 
-For replsh command reference, see [skills/replsh/SKILL.md](skills/replsh/SKILL.md).
+For replsh command reference, run `replsh --help`. To generate the skill file, run `replsh --install-skill`.
 
 This project uses replsh (its own tool) for development. You have a live REPL available — use it.
 

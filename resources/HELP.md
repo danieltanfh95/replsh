@@ -1,20 +1,3 @@
----
-name: replsh
-description: >
-  A thinking medium for LLM agents. Use the REPL to verify assumptions, inspect
-  runtime state, and test hypotheses — think before you write. Timeouts return
-  partial output (never lose work). Streaming and background eval handle any
-  timescale. Supports Clojure (deps.edn, Leiningen, Babashka), Python (native
-  bridge — zero deps, or Jupyter for rich output), and Node.js. Activate when
-  working on any project with a .replsh/config.edn, or any Clojure/Python/Node
-  project where a REPL would help you understand the code.
-license: EPL-2.0
-compatibility: Requires Babashka (bb) installed. REPL servers started by replsh or running externally.
-metadata:
-  author: Daniel Tan
-  repository: https://github.com/danieltanfh95/replsh
----
-
 # replsh
 
 Bash runs commands. A REPL is where you think. Use it to verify before you write, not just to execute after. Timeouts return partial output, streaming gives real-time feedback, and background eval handles anything long-running — so the REPL works at every timescale.
@@ -249,7 +232,7 @@ replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 
 ```bash
 # Session lifecycle
-replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>]
+replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>] [--force]
 replsh launch [backend] --name <n> --container <c>   # exec mode: inject into existing container
 replsh launch [backend] --name <n> --image <img>     # exec mode: spawn container, inject REPL
 replsh start  [backend] --name <n> [--port <p>]
@@ -275,9 +258,18 @@ replsh output --eval-id <id> --follow  # tail bg eval output
 replsh logs --name <n>                 # full server log
 replsh logs --name <n> --tail 20       # last 20 lines
 replsh logs --name <n> --follow        # tail until process exits
+
+# Discovery
+replsh toolchains                      # list all available toolchains (JSON)
+replsh --help                          # full reference
+replsh --install-skill [--path <dest>] # generate skills/replsh/SKILL.md
 ```
 
 Backends: `nrepl`, `python`, `jupyter`, `node`. Optional when using project config.
+
+### Global flags
+
+- `--exit-on-error` — exit with non-zero codes on failure (default: always exit 0). Use this in scripts or CI. Without it, errors are reported in JSON but the process exits 0, which is friendlier for LLM agent tool-calling.
 
 ## Output Format
 
@@ -308,7 +300,7 @@ NDJSON — one JSON line per chunk, final line is the summary:
 - `data.chunks` — all output: `out`, `err`, `value`, `error`, `status`
 - `partial` — true when eval timed out but returned partial output
 - `final` — true on the last line of streaming output
-- Exit codes: 0=success, 1=eval error, 2=client error, 3=hard timeout
+- Exit codes: always 0 by default. With `--exit-on-error`: 0=success, 1=eval error, 2=client error, 3=hard timeout
 
 ## Config
 
@@ -336,10 +328,13 @@ NDJSON — one JSON line per chunk, final line is the summary:
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net')..."` |
 | `clojure.bb.container` | nrepl | Docker: `bb --nrepl-server 0.0.0.0:{port}` |
+| `clojure.deps.container` | nrepl | Docker: `clj -M:nrepl -m nrepl.cmdline --port {port} --bind 0.0.0.0` |
 | `python.container` | python | Docker: `python3 {bridge} --host 0.0.0.0 --port {port}` |
 | `node.container` | node | Docker: `node -e "require('net')..."` |
 
 Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
+
+Run `replsh toolchains` to list all available toolchains (built-in + custom) as JSON.
 
 ## Python Eval Notes
 

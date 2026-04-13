@@ -5,6 +5,7 @@
             [replsh.backend.jupyter]
             [replsh.backend.python]
             [replsh.bridge :as bridge]
+            [replsh.config :as config]
             [replsh.process :as process]
             [replsh.runtime :as runtime]
             [replsh.state :as state]
@@ -421,9 +422,17 @@
             (let [value-chunk (last (filter #(= :value (:type %)) chunks))
                   has-error?  (some #(= :error (:type %)) chunks)
                   result (if has-error?
-                           (let [err-chunk (first (filter #(= :error (:type %)) chunks))]
+                           (let [err-chunk (first (filter #(= :error (:type %)) chunks))
+                                 ;; Prefer :err chunks (actual error text) over :error chunk
+                                 ;; (which is just the class name for nREPL)
+                                 err-text  (->> chunks
+                                                (filter #(= :err (:type %)))
+                                                (map :content)
+                                                (str/join)
+                                                str/trim)
+                                 message   (if (seq err-text) err-text (:content err-chunk))]
                              (output/failure :eval {:code    "eval_error"
-                                                    :message (:content err-chunk)
+                                                    :message message
                                                     :detail  (:meta err-chunk)
                                                     :data    {:name   (:name session)
                                                               :chunks clean-chunks}}))
@@ -836,6 +845,22 @@
                           {:eval-id (.getName f) :status "corrupt"})))
                     files)]
     (output/success :evals {:evals evals})))
+
+;; --- Toolchains ---
+
+(defn toolchains-cmd
+  "List all available toolchains (built-in + user-defined)."
+  []
+  (let [global-cfg (config/load-global-config)
+        all-tc     (config/resolve-toolchains global-cfg)]
+    (output/success :toolchains
+      {:toolchains (vec (sort-by :name
+                          (map (fn [[tc-name tc-spec]]
+                                 {:name    tc-name
+                                  :backend (name (:backend tc-spec))
+                                  :runtime (name (or (:runtime tc-spec) :local))
+                                  :port    (get-in tc-spec [:defaults :port])})
+                               all-tc)))})))
 
 ;; --- Logs ---
 
