@@ -43,42 +43,9 @@
    "bash"           {:backend  :bash
                      :cmd      "python3 {bridge} --port {port} --backend bash"}
 
-   "bash.container" {:backend  :bash
-                     :cmd      "python3 {bridge} --host 0.0.0.0 --port {port} --backend bash"
-                     :runtime  :docker}
-
    "node"           {:backend  :node
                      :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port})\""
-                     :defaults {:port 5001 :prompt-re "> "}}
-
-   ;; --- Docker runtimes ---
-   "clojure.bb.container"
-   {:backend  :nrepl
-    :cmd      "bb --nrepl-server 0.0.0.0:{port}"
-    :defaults {:port 1667}
-    :runtime  :docker
-    :image    "babashka/babashka:latest"}
-
-   "clojure.deps.container"
-   {:backend  :nrepl
-    :cmd      "clj -M:nrepl -m nrepl.cmdline --port {port} --bind 0.0.0.0"
-    :defaults {:port 7888}
-    :runtime  :docker
-    :image    "clojure:temurin-21-tools-deps-1.12.0.1530"}
-
-   "python.container"
-   {:backend  :python
-    :cmd      "python3 {bridge} --host 0.0.0.0 --port {port}"
-    :defaults {:port 9876}
-    :runtime  :docker
-    :image    "python:3.12-slim"}
-
-   "node.container"
-   {:backend  :node
-    :cmd      "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen({port},'0.0.0.0')\""
-    :defaults {:port 5001 :prompt-re "> "}
-    :runtime  :docker
-    :image    "node:22-slim"}})
+                     :defaults {:port 5001 :prompt-re "> "}}})
 
 ;; --- Config file loading ---
 

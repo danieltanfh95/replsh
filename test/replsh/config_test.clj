@@ -53,19 +53,10 @@
       (is (contains? result "python.poetry"))
       (is (contains? result "node"))))
 
-  (testing "bash toolchains are included"
+  (testing "bash toolchain is included"
     (let [result (config/resolve-toolchains nil)]
       (is (contains? result "bash"))
-      (is (= :bash (:backend (get result "bash"))))
-      (is (contains? result "bash.container"))
-      (is (= :docker (:runtime (get result "bash.container"))))))
-
-  (testing "container toolchains are included"
-    (let [result (config/resolve-toolchains nil)]
-      (is (contains? result "clojure.bb.container"))
-      (is (contains? result "clojure.deps.container"))
-      (is (contains? result "python.container"))
-      (is (contains? result "node.container"))))
+      (is (= :bash (:backend (get result "bash"))))))
 
   (testing "user toolchains merge with builtins"
     (let [result (config/resolve-toolchains
@@ -111,24 +102,6 @@
 (deftest resolve-container-session-test
   (let [toolchains (config/resolve-toolchains nil)]
 
-    (testing "container toolchain resolves with runtime :docker"
-      (let [pc {:config {:sessions {"bb" {:toolchain "clojure.bb.container"}}}
-                :dir "/project"}
-            resolved (config/resolve-session toolchains pc "bb" {})]
-        (is (= :docker (:runtime resolved)))
-        (is (= "babashka/babashka:latest" (:image resolved)))
-        (is (= :nrepl (:backend-type resolved)))
-        (is (= "/workspace" (:container-cwd resolved)))
-        (is (.contains (:cmd resolved) "1667"))))
-
-    (testing "python container resolves bridge to container path"
-      (let [pc {:config {:sessions {"py" {:toolchain "python.container"}}}
-                :dir "/project"}
-            resolved (config/resolve-session toolchains pc "py" {})]
-        (is (= :docker (:runtime resolved)))
-        (is (.contains (:cmd resolved) "/tmp/replsh/replsh_bridge.py"))
-        (is (not (.contains (:cmd resolved) "{bridge}")))))
-
     (testing "session-level runtime override"
       (let [pc {:config {:sessions {"bb" {:toolchain "clojure.bb"
                                            :runtime :docker
@@ -154,15 +127,6 @@
             resolved (config/resolve-session toolchains pc "bb" {:port 1667})]
         (is (= :local (:runtime resolved)))
         (is (nil? (:image resolved)))))
-
-    (testing "exec mode: container session without cmd resolves correctly"
-      (let [pc {:config {:sessions {"api" {:toolchain "python.container"
-                                            :container "my-flask-app"}}}
-                :dir "/project"}
-            resolved (config/resolve-session toolchains pc "api" {})]
-        (is (= :docker (:runtime resolved)))
-        (is (= "my-flask-app" (:container resolved)))
-        (is (= :python (:backend-type resolved)))))
 
     (testing "exec mode: image without cmd preserves image, no cmd required"
       (let [pc {:config {:sessions {"api" {:runtime :docker

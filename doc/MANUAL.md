@@ -32,25 +32,22 @@ replsh launch [backend] --name <name> [options]
 | `--env` | `-e` | Environment variable (`K=V`, repeatable) |
 | `--init` | `-i` | Bootstrap code to run after connecting |
 | `--timeout` | `-t` | Port readiness timeout in ms (default: 30000) |
-| `--container` | `-c` | Exec into existing Docker container (exec mode) |
-| `--image` | | Docker image — exec mode (no `--cmd`) or port mode (with `--cmd`) |
+| `--image` | | Docker image for port-mode containerized REPL (requires `--cmd`) |
 | `--force` | `-f` | Replace an existing live session with the same name without error |
 | `--volume` | `-v` | Docker volume mount (`host:container[:opts]`, repeatable). Requires `--image`. |
 | `--platform` | | Docker platform override (e.g., `linux/amd64`). Requires `--image`. |
-| `--ssh-host` | | SSH host or `~/.ssh/config` alias — triggers exec mode via SSH |
-| `--exec-port` | | Bridge port inside container, exec mode (default: 9876) |
+| `--exec-port` | | Bridge port inside the exec chain (default: 9876) |
 | `--kernel` | `-k` | Jupyter kernel name (default: `python3`) |
 | `--token` | | Jupyter auth token |
 | `--prompt-re` | | Node.js prompt string (default: `> `) |
 
 **Mode detection:**
 
-| Flags | Mode | Behavior |
-|-------|------|----------|
+| Invocation | Mode | Behavior |
+|------------|------|----------|
 | `--cmd` (with or without `--image`) | Port mode | Bridge replaces container entrypoint, port exposed to host |
-| `--container` (no `--cmd`) | Exec mode | Inject bridge into existing container via `docker exec` |
-| `--image` (no `--cmd`) | Exec mode | Spawn container with default entrypoint, inject bridge |
-| `--ssh-host` (alone or with `--container`) | Exec mode | Inject bridge via SSH; optionally `docker exec` inside remote container |
+| `-- --runtime ...` (after `--`) | Exec mode | Inject bridge through the ordered via chain |
+| Config session has `:via` key | Exec mode | Via chain read from config |
 
 **Examples:**
 
@@ -77,51 +74,81 @@ replsh launch --name dev --init "(require '[my.app])"
 
 #### Exec mode
 
-Exec mode injects a Python REPL into an existing or remote container without replacing its entrypoint. SSH and Docker are independent, composable layers — use either or both:
+Exec mode injects a REPL bridge into an existing or remote container without replacing its entrypoint. The execution chain is expressed as an ordered list of layers after `--`, left to right from outermost to innermost:
 
 ```bash
-# Inject REPL into an already-running container
-replsh launch python --name api --container my-flask-app
+# Into an already-running container
+replsh launch --name api -- \
+  --runtime docker --container my-flask-app \
+  --toolchain python
 
-# Start a container with its default entrypoint, then inject REPL
-replsh launch python --name api --image myapp:latest
+# Spawn a new container, inject REPL (owned — replsh will stop it)
+replsh launch --name api -- \
+  --runtime docker --image myapp:latest \
+  --toolchain python
 
-# SSH only (remote machine — jump hosts, keys, ports from ~/.ssh/config)
-replsh launch python --name remote --ssh-host my-machine
+# SSH only (remote machine)
+replsh launch --name remote -- \
+  --runtime ssh --host my-machine \
+  --toolchain python
 
-# SSH + Docker (e.g. local → jumphost → remote Docker host)
-replsh launch python --name remote --ssh-host my-machine --container my-app
+# SSH → Docker (local → remote Docker host)
+replsh launch --name remote -- \
+  --runtime ssh --host my-machine \
+  --runtime docker --container my-app \
+  --toolchain python
+
+# Docker → SSH (inside an outer container, SSH to internal host)
+replsh launch --name dind -- \
+  --runtime docker --container outer \
+  --runtime ssh --host internal.host \
+  --toolchain python
+
+# SSH → Docker → Bash (environment setup, e.g. rbenv)
+replsh launch --name rbenv -- \
+  --runtime ssh --host my-machine \
+  --runtime docker --container my-app \
+  --runtime bash --setup "source /etc/profile.d/rbenv.sh" \
+  --toolchain python
 
 # State persists across evals
 replsh eval --name api '1 + 2'        # → 3
 replsh eval --name api 'x = 42'
 replsh eval --name api 'print(x)'    # → 42
 
-# Stop: kills bridge but leaves unowned container running
+# Stop: kills bridge; if container was spawned (--image), also stops container
 replsh stop api
 ```
 
+**Pipeline flags (after `--`):**
+
+| Flag | Layer | Description |
+|------|-------|-------------|
+| `--runtime ssh` | `:ssh` | SSH access layer |
+| `--host user@host` | ssh | Remote host (or `~/.ssh/config` alias) |
+| `--port 2222` | ssh | SSH port override |
+| `--key ~/.ssh/work` | ssh | Identity file override |
+| `--runtime docker` | `:docker` | Docker exec/run layer |
+| `--container abc123` | docker | Attach to existing container |
+| `--image python:3.12` | docker | Spawn new container |
+| `--user root` | docker | `docker exec --user` override |
+| `--runtime bash` | `:bash` | Environment setup layer |
+| `--setup "cmd"` | bash | Setup command (repeatable, joined with `&&`) |
+| `--toolchain python` | terminal | Backend toolchain (sets REPL type) |
+
 **How it works:**
 
-1. Bridge is deployed into the target via stdin piping (`cat > /tmp/replsh/replsh_bridge.py`) — through SSH and/or `docker exec -i` as needed
-2. A persistent bridge server starts inside the target (`python3 /tmp/replsh/replsh_bridge.py --port 9876`), listening on localhost only (no port exposure)
-3. Each eval opens an ephemeral proxy that relays stdin↔TCP — the proxy command is composed from whichever of SSH/Docker are set
-4. `replsh stop` kills the bridge; if the container was spawned by replsh (`--image`), it also stops the container
-
-**Exec command composition:**
-
-| `ssh-host` | `container` | Exec command |
-|-----------|-------------|--------------|
-| — | ✓ | `docker exec -i <container> sh -c <cmd>` |
-| ✓ | — | `ssh <host> sh -c <cmd>` |
-| ✓ | ✓ | `ssh <host> docker exec -i <container> sh -c <cmd>` |
-
-`--ssh-host` accepts any alias from `~/.ssh/config`. ProxyJump, user, port, and identity file are all read from SSH config — replsh just passes the name through.
+1. Bridge is deployed via stdin piping (`cat > /tmp/replsh/replsh_bridge.py`) through the via chain
+2. A persistent bridge server starts at the end of the chain, listening on localhost (no port exposure)
+3. Each eval opens an ephemeral proxy that relays stdin↔TCP through the same via chain
+4. `replsh stop` kills the bridge; owned containers (spawned via `--image`) are also stopped
 
 **Owned vs unowned containers:**
 
 - `--container <name>`: Container is **unowned** — replsh will not stop it on `replsh stop`
 - `--image <name>`: Container is **owned** — replsh spawned it and will stop+remove it on `replsh stop`
+
+`--host` accepts any alias from `~/.ssh/config`. ProxyJump, user, port, and identity file are all read from SSH config — replsh just passes the alias through.
 
 ### start
 
@@ -401,17 +428,42 @@ Searched from the current working directory upward to the filesystem root (like 
 | `:token` | Jupyter auth token |
 | `:prompt-re` | Node.js prompt string |
 | `:env` | Environment variables map |
-| `:container` | Existing Docker container name (exec mode) |
+| `:via` | Ordered via chain for exec mode (see below) |
 
 **Exec-mode config example:**
 
 ```clojure
 {:sessions
- {"api" {:toolchain "python.container"
-         :container "di-contracts"}}}
+ {"api"      {:via [{:type :docker :container "my-flask-app"}]
+              :toolchain "python"}
+
+  "remote"   {:via [{:type :ssh :host "my-machine"}
+                    {:type :docker :container "my-app"}]
+              :toolchain "python"}
+
+  "rbenv"    {:via [{:type :ssh :host "my-machine"}
+                    {:type :docker :container "my-app"}
+                    {:type :bash :setup ["source /etc/profile.d/rbenv.sh"]}]
+              :toolchain "python"}}}
 ```
 
-When `:container` is set (or `:image` is set without `:cmd`), replsh uses exec mode — injecting the bridge into the container instead of replacing its entrypoint.
+When `:via` is set, replsh uses exec mode — injecting the bridge through the ordered layer chain.
+
+**Via layer specs:**
+
+```clojure
+;; SSH access layer
+{:type :ssh  :host "user@host"  :port 22  :key "~/.ssh/id_rsa"}  ; :port and :key optional
+
+;; Docker exec (attach to existing container)
+{:type :docker  :container "abc123"  :user "root"}               ; :user optional
+
+;; Docker run (spawn new container)
+{:type :docker  :image "python:3.12"}
+
+;; Bash environment wrapper
+{:type :bash  :setup ["source /etc/profile.d/rbenv.sh" "rbenv shell 3.1.0"]}
+```
 
 ### Global config — `~/.replsh/config.edn`
 
@@ -458,12 +510,21 @@ Command strings support `{port}`, `{cwd}`, `{host}`, and `{bridge}` placeholders
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` | port 8888, kernel python3 |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` | port 8888, kernel python3 |
 | `bash` | bash | `python3 {bridge} --port {port} --backend bash` | — |
-| `bash.container` | bash | `python3 {bridge} --host 0.0.0.0 --port {port} --backend bash` | Docker |
 | `node` | node | `node -e "require('net')..."` | port 5001, prompt "> " |
-| `clojure.bb.container` | nrepl | `bb --nrepl-server 0.0.0.0:{port}` | port 1667, Docker |
-| `clojure.deps.container` | nrepl | `clj -M:nrepl ... --bind 0.0.0.0` | port 7888, Docker |
-| `python.container` | python | `python3 {bridge} --host 0.0.0.0 --port {port}` | port 9876, Docker |
-| `node.container` | node | `node -e "require('net')..."` | port 5001, Docker |
+
+**Port-mode Docker REPL** (spawn a fresh isolated container, expose a port to the host) — define as a custom toolchain:
+
+```clojure
+;; ~/.replsh/config.edn
+{:toolchains
+ {"python.myimage" {:backend  :python
+                    :cmd      "python3 {bridge} --host 0.0.0.0 --port {port}"
+                    :runtime  :docker
+                    :image    "python:3.12-slim"
+                    :defaults {:port 9876}}}}
+```
+
+This differs from exec mode: exec mode injects into an existing container with no port exposure; port-mode Docker spawns a fresh container and exposes a port to the host.
 
 ## Output Format
 

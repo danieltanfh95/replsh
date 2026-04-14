@@ -22,19 +22,47 @@
 (defmulti exec!          (fn [info _cmd _opts] (:runtime info)))
 (defmulti deploy-bridge! :runtime)
 
+;; --- Session normalization ---
+
+(defn normalize-session
+  "Ensure a session config has :runtime set (defaults to :local).
+   Also migrates old :docker exec-mode sessions to the unified :exec runtime,
+   and migrates old flat-key :exec sessions (ssh-host/container-id) to :via format."
+  [session]
+  (let [session (cond-> session
+                  (not (:runtime session))
+                  (assoc :runtime :local)
+                  (and (= :docker (:runtime session))
+                       (= :exec (get-in session [:transport :type])))
+                  (assoc :runtime :exec))
+        ;; Migrate old flat-key :exec sessions to :via format
+        session (if (and (= :exec (:runtime session))
+                         (not (get-in session [:launch :via]))
+                         (or (get-in session [:launch :ssh-host])
+                             (get-in session [:launch :container-id])))
+                  (update session :launch assoc :via
+                          (cond-> []
+                            (get-in session [:launch :ssh-host])
+                            (conj {:type :ssh :host (get-in session [:launch :ssh-host])})
+                            (get-in session [:launch :container-id])
+                            (conj {:type :docker :container (get-in session [:launch :container-id])})))
+                  session)]
+    session))
+
 ;; --- Helpers ---
 
 (defn session->runtime-info
-  "Build a runtime-info map from a persisted session config."
+  "Build a runtime-info map from a persisted session config.
+   Normalizes the session first (migrates old flat-key :exec format to :via)."
   [session]
-  (let [rt    (or (:runtime session) :local)
-        launch (:launch session)]
+  (let [session (normalize-session session)
+        rt      (or (:runtime session) :local)
+        launch  (:launch session)]
     (cond-> {:runtime rt :name (:name session)}
       (= rt :local)  (assoc :pid (:pid launch))
       (= rt :docker) (assoc :container-id (:container-id launch))
-      (= rt :exec)   (assoc :pid          (:bridge-pid launch)
-                            :ssh-host     (:ssh-host launch)
-                            :container-id (:container-id launch)))))
+      (= rt :exec)   (assoc :pid (:bridge-pid launch)
+                            :via (:via launch)))))
 
 ;; --- Docker CLI helpers ---
 
@@ -61,19 +89,6 @@
   (try
     (apply run-docker! args)
     (catch Exception _ nil)))
-
-;; --- Session normalization ---
-
-(defn normalize-session
-  "Ensure a session config has :runtime set (defaults to :local).
-   Also migrates old :docker exec-mode sessions to the unified :exec runtime."
-  [session]
-  (cond-> session
-    (not (:runtime session))
-    (assoc :runtime :local)
-    (and (= :docker (:runtime session))
-         (= :exec (get-in session [:transport :type])))
-    (assoc :runtime :exec)))
 
 ;; ==========================================================================
 ;; :local runtime — delegates to existing process.clj
@@ -265,7 +280,7 @@
     dest-path))
 
 ;; ==========================================================================
-;; :exec runtime — bridge via SSH and/or Docker exec (compose as needed)
+;; :exec runtime — ordered via-chain: SSH, Docker, and Bash layers
 ;; ==========================================================================
 
 (defn- shell-escape
@@ -273,47 +288,70 @@
   [s]
   (str "'" (str/replace s "'" "'\\''") "'"))
 
-(defn- exec-args
-  "Build a ProcessBuilder args vector for the given exec combination.
-   ssh-host and container-id are both optional."
-  [{:keys [ssh-host container-id]} cmd]
-  (cond
-    (and ssh-host container-id)
-    ["ssh" "-o" "BatchMode=yes" ssh-host
-     (str "docker exec -i " container-id " sh -c " (shell-escape cmd))]
+(defn- layer->str
+  "Wrap inner-cmd string through a non-outermost exec layer.
+   Returns a shell string suitable for passing as an argument to an outer process."
+  [layer inner-cmd]
+  (case (:type layer)
+    :ssh    (str "ssh -o BatchMode=yes "
+                 (when (:port layer) (str "-p " (:port layer) " "))
+                 (when (:key layer) (str "-i " (:key layer) " "))
+                 (:host layer) " " (shell-escape inner-cmd))
+    :docker (str "docker exec -i "
+                 (when (:user layer) (str "--user " (:user layer) " "))
+                 (:container layer) " sh -c " (shell-escape inner-cmd))))
 
-    ssh-host
-    ["ssh" "-o" "BatchMode=yes" ssh-host (str "sh -c " (shell-escape cmd))]
+(defn- layer->vec
+  "Render the outermost exec layer as a ProcessBuilder argv vector."
+  [layer inner-cmd]
+  (case (:type layer)
+    :ssh    (cond-> ["ssh" "-o" "BatchMode=yes"]
+              (:port layer) (into ["-p" (str (:port layer))])
+              (:key layer)  (into ["-i" (:key layer)])
+              true          (into [(:host layer) inner-cmd]))
+    :docker (cond-> ["docker" "exec" "-i"]
+              (:user layer) (into ["--user" (:user layer)])
+              true          (into [(:container layer) "sh" "-c" inner-cmd]))))
 
-    container-id
-    ["docker" "exec" "-i" container-id "sh" "-c" cmd]
-
-    :else
-    ["/bin/sh" "-c" cmd]))
+(defn via-args
+  "Build ProcessBuilder args for executing cmd through the via chain (outermost first).
+   :bash layers fold their setup commands into the cmd string rather than becoming
+   outer processes. The outermost process is always the first non-bash exec layer."
+  [via cmd]
+  (let [exec-via    (remove #(= :bash (:type %)) via)
+        bash-layers (filter #(= :bash (:type %)) via)
+        ;; Fold bash setup into the command string
+        inner-cmd   (reduce (fn [s bl]
+                              (str (str/join " && " (:setup bl)) " && " s))
+                            cmd bash-layers)
+        wrapped (if (empty? exec-via)
+                  ["/bin/sh" "-c" inner-cmd]
+                  ;; Build from innermost outward: reverse(rest) layers wrap the cmd,
+                  ;; then the first (outermost) layer becomes the ProcessBuilder process.
+                  (let [s (reduce #(layer->str %2 %1) inner-cmd (reverse (rest exec-via)))]
+                    (layer->vec (first exec-via) s)))]
+    wrapped))
 
 (defmethod exec! :exec
-  [{:keys [name] :as runtime-info} cmd _opts]
+  [{:keys [name via]} cmd _opts]
   (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
         _        (.mkdirs (File. log-dir))
         log-file (File. (str log-dir (or name "exec") ".exec.log"))
-        pb       (doto (ProcessBuilder. ^java.util.List (exec-args runtime-info cmd))
+        pb       (doto (ProcessBuilder. ^java.util.List (via-args (or via []) cmd))
                    (.redirectError (ProcessBuilder$Redirect/appendTo log-file)))
         process  (.start pb)]
     {:in  (BufferedReader. (InputStreamReader. (.getInputStream process) StandardCharsets/UTF_8))
      :out (PrintWriter. (OutputStreamWriter. (.getOutputStream process) StandardCharsets/UTF_8) true)
      :process process}))
 
-(defmethod deploy-bridge! :exec [{:keys [ssh-host container-id]}]
+(defmethod deploy-bridge! :exec [{:keys [via]}]
   (require 'replsh.bridge)
   (let [local-path  ((resolve 'replsh.bridge/ensure-bridge!))
         remote-path "/tmp/replsh/replsh_bridge.py"
-        dest-cmd    (if container-id
-                      (str "docker exec -i " container-id
-                           " sh -c 'mkdir -p /tmp/replsh && cat > " remote-path "'")
-                      (str "mkdir -p /tmp/replsh && cat > " remote-path))
-        args        (if ssh-host
-                      ["ssh" "-o" "BatchMode=yes" ssh-host dest-cmd]
-                      ["/bin/sh" "-c" dest-cmd])
+        ;; Strip bash layers for file transfer — they affect the runtime env, not destinations
+        deploy-via  (vec (remove #(= :bash (:type %)) (or via [])))
+        dest-cmd    (str "mkdir -p /tmp/replsh && cat > " remote-path)
+        args        (via-args deploy-via dest-cmd)
         pb          (ProcessBuilder. ^java.util.List args)
         process     (.start pb)]
     (let [proc-out (.getOutputStream process)]
@@ -324,46 +362,62 @@
       (throw (ex-info "Failed to deploy bridge" {:code :deploy-failed})))
     remote-path))
 
-(defmethod alive? :exec [{:keys [pid ssh-host container-id]}]
-  (cond
-    container-id
-    (try
-      (let [inspect-cmd (str "docker inspect --format '{{.State.Running}}' " container-id)
-            args        (if ssh-host
-                          ["ssh" "-o" "BatchMode=yes" ssh-host inspect-cmd]
-                          ["/bin/sh" "-c" inspect-cmd])
-            proc        (-> (ProcessBuilder. ^java.util.List args) .start)
-            out         (str/trim (slurp (.getInputStream proc)))]
-        (.waitFor proc)
-        (= out "true"))
-      (catch Exception _ false))
-    pid (process/alive? pid)
-    :else false))
+(defmethod alive? :exec [{:keys [pid via]}]
+  (let [exec-via     (vec (remove #(= :bash (:type %)) (or via [])))
+        docker-layer (last (filter #(= :docker (:type %)) exec-via))
+        outer-via    (vec (take-while #(not= % docker-layer) exec-via))]
+    (cond
+      docker-layer
+      (try
+        (let [inspect-cmd (str "docker inspect --format '{{.State.Running}}' " (:container docker-layer))
+              args        (via-args outer-via inspect-cmd)
+              proc        (-> (ProcessBuilder. ^java.util.List args) .start)
+              out         (str/trim (slurp (.getInputStream proc)))]
+          (.waitFor proc)
+          (= out "true"))
+        (catch Exception _ false))
+      pid   (process/alive? pid)
+      :else false)))
 
-(defmethod stop! :exec [{:keys [ssh-host container-id]}]
-  (when container-id
-    (let [stop-cmd (str "docker stop " container-id " && docker rm " container-id)
-          args     (if ssh-host
-                     ["ssh" "-o" "BatchMode=yes" ssh-host stop-cmd]
-                     ["/bin/sh" "-c" stop-cmd])]
-      (try (-> (ProcessBuilder. ^java.util.List args) .start .waitFor)
-           (catch Exception _)))))
+(defmethod stop! :exec [{:keys [via]}]
+  (let [exec-via     (vec (remove #(= :bash (:type %)) (or via [])))
+        docker-layer (last (filter #(= :docker (:type %)) exec-via))
+        outer-via    (vec (take-while #(not= % docker-layer) exec-via))]
+    (when docker-layer
+      (let [stop-cmd (str "docker stop " (:container docker-layer) " && docker rm " (:container docker-layer))
+            args     (via-args outer-via stop-cmd)]
+        (try (-> (ProcessBuilder. ^java.util.List args) .start .waitFor)
+             (catch Exception _))))))
 
-(defmethod spawn! :exec [{:keys [ssh-host image name env-vars volumes platform]}]
-  (let [cname       (str "replsh-" name)
-        docker-args (cond-> ["docker" "run" "-d" "--name" cname]
-                      platform       (into ["--platform" platform])
-                      (seq volumes)  (into (mapcat (fn [v] ["-v" v]) volumes))
-                      (seq env-vars) (into (mapcat (fn [[k v]] ["-e" (str k "=" v)]) env-vars))
-                      true           (conj image))
-        args        (if ssh-host
-                      ["ssh" "-o" "BatchMode=yes" ssh-host
-                       (str/join " " docker-args)]
-                      docker-args)
-        proc        (-> (ProcessBuilder. ^java.util.List args) .start)
-        cid         (str/trim (slurp (.getInputStream proc)))]
-    (.waitFor proc)
-    {:runtime :exec :container-id cid}))
+(defmethod spawn! :exec [{:keys [via name env-vars volumes platform]}]
+  (let [exec-via     (vec (remove #(= :bash (:type %)) (or via [])))
+        docker-idx   (first (keep-indexed (fn [i l] (when (and (= :docker (:type l)) (:image l)) i)) exec-via))
+        docker-layer (when docker-idx (nth exec-via docker-idx))
+        outer-via    (when docker-idx (vec (take docker-idx exec-via)))]
+    (when-not docker-layer
+      (throw (ex-info "No docker layer with :image found in :via for spawn!"
+                      {:code :missing-image :via via})))
+    (let [cname       (str "replsh-" name)
+          docker-args (cond-> ["docker" "run" "-d" "--name" cname]
+                        (:platform docker-layer) (into ["--platform" (:platform docker-layer)])
+                        platform                  (into ["--platform" platform])
+                        (seq volumes)             (into (mapcat (fn [v] ["-v" v]) volumes))
+                        (seq env-vars)            (into (mapcat (fn [[k v]] ["-e" (str k "=" v)]) env-vars))
+                        true                      (conj (:image docker-layer)))
+          ;; Route docker run through any outer layers (e.g., SSH)
+          args        (if (seq outer-via)
+                        (via-args outer-via (str/join " " docker-args))
+                        docker-args)
+          proc        (-> (ProcessBuilder. ^java.util.List args) .start)
+          cid         (str/trim (slurp (.getInputStream proc)))]
+      (.waitFor proc)
+      ;; Return updated :via with container-id substituted for :image in the docker layer
+      {:runtime :exec
+       :via     (mapv (fn [l]
+                        (if (and (= :docker (:type l)) (:image l))
+                          (-> l (dissoc :image) (assoc :container cid))
+                          l))
+                      (or via []))})))
 
 (defmethod send-signal! :exec [{:keys [pid]} signal]
   (when pid

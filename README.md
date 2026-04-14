@@ -33,10 +33,17 @@ bbin install . --as replsh
 
 ## Add as a Skill
 
-replsh includes a [skills.sh](https://skills.sh/)-compatible [skill document](skills/replsh/SKILL.md) that teaches LLM agents how to use the REPL proactively. To load it, add this line to your project's `CLAUDE.md` or `AGENTS.md`:
+Generate a [skills.sh](https://skills.sh/)-compatible skill document that teaches LLM agents how to use the REPL proactively:
+
+```bash
+replsh --install-skill                  # writes to skills/replsh/SKILL.md
+replsh --install-skill --path my.md    # custom path
+```
+
+Or just point agents at the built-in help directly in your `CLAUDE.md` or `AGENTS.md`:
 
 ```markdown
-Read and follow the replsh skill: https://raw.githubusercontent.com/danieltanfh95/replsh/main/skills/replsh/SKILL.md
+Run `replsh --help` and read the output to learn the replsh skill. Follow it.
 ```
 
 ## Quick Start
@@ -98,33 +105,62 @@ replsh eval --name dev '(risky-fn)' --timeout 5000 --hard-timeout 60000
 
 Soft timeout (partial output at 5s) + hard timeout (interrupt eval at 60s). `--hard-timeout` sends a backend interrupt — guaranteed to stop the eval.
 
-## Exec Mode (Inject REPL into Containers)
+## Exec Mode (Inject REPL via a Via Chain)
 
-Inject a Python REPL into an existing or project container — without replacing its entrypoint. SSH and Docker are independent, composable layers:
+Inject a REPL bridge into any target reachable through an ordered chain of SSH, Docker, and environment layers — without touching the container entrypoint or exposing a port.
+
+The chain is described left-to-right after `--`, with `--runtime` opening each layer:
 
 ```bash
 # Into an already-running container
-replsh launch python --name api --container my-flask-app
+replsh launch --name api -- \
+  --runtime docker --container my-flask-app \
+  --toolchain python
 
-# Start a container with its default entrypoint, then inject REPL
-replsh launch python --name api --image myapp:latest
+# SSH → Docker (local → remote Docker host)
+replsh launch --name remote -- \
+  --runtime ssh --host my-machine \
+  --runtime docker --container my-app \
+  --toolchain python
 
-# SSH only (remote machine — jump hosts, keys, and ports from ~/.ssh/config)
-replsh launch python --name remote --ssh-host my-machine
+# Docker → SSH (reversed — from inside a container, reach an internal host)
+replsh launch --name dind -- \
+  --runtime docker --container outer \
+  --runtime ssh --host internal.host \
+  --toolchain python
 
-# SSH + Docker (local → jumphost → remote Docker host)
-replsh launch python --name remote --ssh-host my-machine --container my-app
+# SSH → Docker → Bash (environment setup: rbenv, conda, nvm, ...)
+replsh launch --name rbenv -- \
+  --runtime ssh --host my-machine \
+  --runtime docker --container my-app \
+  --runtime bash --setup "source /etc/profile.d/rbenv.sh" \
+  --toolchain python
 
 # State persists across evals
 replsh eval --name api 'import sys; print(sys.version)'
 replsh eval --name api 'x = 42'
 replsh eval --name api 'print(x)'   # → 42
 
-# Stop: kills bridge, leaves unowned container running
-replsh stop api
+replsh stop api  # kills bridge; leaves unowned containers running
 ```
 
-The bridge runs persistently inside the container on localhost (no port exposure). Each eval opens an ephemeral proxy via `docker exec -i` or `ssh host docker exec -i`. `--ssh-host` accepts any alias from `~/.ssh/config` — ProxyJump, user, port, and identity file are all read from there.
+Chains can also live in config:
+
+```clojure
+;; .replsh/config.edn
+{:sessions
+ {"remote"  {:via [{:type :ssh :host "my-machine"}
+                   {:type :docker :container "my-app"}]
+             :toolchain "python"}
+  "rbenv"   {:via [{:type :ssh :host "my-machine"}
+                   {:type :docker :container "my-app"}
+                   {:type :bash :setup ["source /etc/profile.d/rbenv.sh"]}]
+             :toolchain "python"}}}
+```
+
+Then just `replsh launch --name remote`.
+
+The bridge deploys via stdin piping through the chain and runs persistently on localhost inside the target (no port exposure). Each eval opens an ephemeral proxy through the same chain. `--host` accepts any `~/.ssh/config` alias — ProxyJump, user, port, and identity file are all inherited.
 
 ## Session Management
 
@@ -162,13 +198,9 @@ replsh logs --name dev       # read server process logs
 | `python.poetry.jupyter` | jupyter | `poetry run jupyter server --port {port}` |
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `bash` | bash | `python3 {bridge} --port {port} --backend bash` |
-| `bash.container` | bash | Docker: `python3 {bridge} --host 0.0.0.0 --port {port} --backend bash` |
 | `node` | node | `node -e "require('net').createServer(...)..."` |
-| `clojure.bb.container` | nrepl | Docker: `bb --nrepl-server 0.0.0.0:{port}` |
-| `python.container` | python | Docker: `python3 {bridge} --host 0.0.0.0 --port {port}` |
-| `node.container` | node | Docker: `node -e "require('net')..."` |
 
-Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
+Run `replsh toolchains` for the full list including Docker port-mode variants. Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
 
 ## Output Format
 

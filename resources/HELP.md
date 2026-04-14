@@ -138,20 +138,44 @@ replsh launch node --name frontend --port 5001 \
   --cmd "node -e \"require('net').createServer(s=>require('repl').start({input:s,output:s})).listen(5001)\""
 ```
 
-### 3. Exec mode (inject REPL into containers)
+### 3. Exec mode (inject REPL via a via chain)
+
+The execution chain is described left-to-right after `--`, with `--runtime` opening each layer and `--toolchain` naming the backend:
 
 ```bash
 # Into an already-running container (unowned — won't stop it)
-replsh launch python --name api --container my-flask-app
+replsh launch --name api -- \
+  --runtime docker --container my-flask-app \
+  --toolchain python
 
-# Start container with its default entrypoint, inject REPL (owned — will stop it)
-replsh launch python --name api --image myapp:latest
+# Spawn new container, inject REPL (owned — will stop it)
+replsh launch --name api -- \
+  --runtime docker --image myapp:latest \
+  --toolchain python
 
-# SSH only (remote machine — jump hosts, keys, and ports from ~/.ssh/config)
-replsh launch python --name remote --ssh-host my-machine
+# SSH only (remote machine)
+replsh launch --name remote -- \
+  --runtime ssh --host my-machine \
+  --toolchain python
 
-# SSH + Docker (e.g. local → jumphost → remote Docker host)
-replsh launch python --name remote --ssh-host my-machine --container my-app
+# SSH → Docker (local → remote Docker host)
+replsh launch --name remote -- \
+  --runtime ssh --host my-machine \
+  --runtime docker --container my-app \
+  --toolchain python
+
+# Docker → SSH (reversed — from inside a container, reach an internal host)
+replsh launch --name dind -- \
+  --runtime docker --container outer \
+  --runtime ssh --host internal.host \
+  --toolchain python
+
+# SSH → Docker → Bash (environment setup layer)
+replsh launch --name rbenv -- \
+  --runtime ssh --host my-machine \
+  --runtime docker --container my-app \
+  --runtime bash --setup "source /etc/profile.d/rbenv.sh" \
+  --toolchain python
 
 # State persists across evals
 replsh eval --name api 'import flask; print(flask.__version__)'
@@ -161,7 +185,20 @@ replsh eval --name api 'print(x)'   # → 42
 replsh stop api
 ```
 
-`--ssh-host` accepts any host alias from `~/.ssh/config`. ProxyJump, user, port, and identity file are all read from SSH config — replsh just passes the name through.
+In config (`.replsh/config.edn`), express the chain as `:via`:
+
+```clojure
+{:sessions
+ {"remote"  {:via [{:type :ssh :host "my-machine"}
+                   {:type :docker :container "my-app"}]
+             :toolchain "python"}
+  "rbenv"   {:via [{:type :ssh :host "my-machine"}
+                   {:type :docker :container "my-app"}
+                   {:type :bash :setup ["source /etc/profile.d/rbenv.sh"]}]
+             :toolchain "python"}}}
+```
+
+`--host` accepts any alias from `~/.ssh/config`. ProxyJump, user, port, and identity file are all read automatically.
 
 ### 4. Eval
 
@@ -244,9 +281,7 @@ replsh eval --name dev '(train-model)' --timeout 0 --hard-timeout 300000
 ```bash
 # Session lifecycle
 replsh launch [backend] --name <n> [--cmd <c>] [--port <p>] [--init <code>] [--timeout <ms>] [--force] [--volume <host:container[:opts]>] [--platform <platform>]
-replsh launch [backend] --name <n> --container <c>                    # exec mode: inject into existing container
-replsh launch [backend] --name <n> --image <img>                      # exec mode: spawn container, inject REPL
-replsh launch [backend] --name <n> --ssh-host <host> [--container <c>]  # exec mode: via SSH
+replsh launch --name <n> -- --runtime <type> [layer flags] ... --toolchain <name>   # exec mode: via chain
 replsh start  [backend] --name <n> [--port <p>]
 replsh ls
 replsh status --name <n>
@@ -289,8 +324,25 @@ Backends: `nrepl`, `python`, `jupyter`, `node`, `bash`. Optional when using proj
 ### Launch flag notes
 
 - `--force` — replaces an existing live session with the same name (stop + relaunch without error)
-- `--volume` / `-v` — Docker volume mount (`host:container[:opts]`, repeatable). Requires `--image`.
-- `--platform` — Docker platform override (e.g., `linux/amd64`). Requires `--image`.
+- `--volume` / `-v` — Docker volume mount (`host:container[:opts]`, repeatable). Port mode only.
+- `--platform` — Docker platform override (e.g., `linux/amd64`). Port mode only.
+- `--exec-port` — bridge listen port inside the exec chain (default: 9876)
+
+**Exec mode via chain flags (after `--`):**
+
+| Flag | Layer | Description |
+|------|-------|-------------|
+| `--runtime ssh` | `:ssh` | SSH access layer |
+| `--host user@host` | ssh | Remote host or `~/.ssh/config` alias |
+| `--port 2222` | ssh | SSH port override |
+| `--key ~/.ssh/work` | ssh | Identity file override |
+| `--runtime docker` | `:docker` | Docker exec/run layer |
+| `--container abc123` | docker | Attach to existing container (unowned) |
+| `--image python:3.12` | docker | Spawn new container (owned) |
+| `--user root` | docker | `docker exec --user` override |
+| `--runtime bash` | `:bash` | Environment setup (wraps cmd with setup commands) |
+| `--setup "cmd"` | bash | Setup command (repeatable, joined with `&&`) |
+| `--toolchain python` | terminal | Backend toolchain name |
 
 ### Global flags
 
@@ -336,10 +388,20 @@ NDJSON — one JSON line per chunk, last line is the summary:
 
 ```clojure
 {:sessions
+ ;; Port-mode sessions (local or Docker)
  {"backend" {:toolchain "clojure.bb"
              :init "(require '[my.app])"}
   "ml"      {:toolchain "python.poetry"
-             :cwd "ml/"}}}
+             :cwd "ml/"}
+
+  ;; Exec-mode sessions — use :via for the ordered layer chain
+  "remote"  {:via [{:type :ssh :host "my-machine"}
+                   {:type :docker :container "my-app"}]
+             :toolchain "python"}
+  "rbenv"   {:via [{:type :ssh :host "my-machine"}
+                   {:type :docker :container "my-app"}
+                   {:type :bash :setup ["source /etc/profile.d/rbenv.sh"]}]
+             :toolchain "python"}}}
 ```
 
 ### Built-in toolchains
@@ -356,13 +418,22 @@ NDJSON — one JSON line per chunk, last line is the summary:
 | `python.venv.jupyter` | jupyter | `{cwd}/.venv/bin/jupyter server --port {port}` |
 | `node` | node | `node -e "require('net')..."` |
 | `bash` | bash | `python3 {bridge} --port {port} --backend bash` |
-| `bash.container` | bash | Docker: `python3 {bridge} --host 0.0.0.0 --port {port} --backend bash` |
-| `clojure.bb.container` | nrepl | Docker: `bb --nrepl-server 0.0.0.0:{port}` |
-| `clojure.deps.container` | nrepl | Docker: `clj -M:nrepl -m nrepl.cmdline --port {port} --bind 0.0.0.0` |
-| `python.container` | python | Docker: `python3 {bridge} --host 0.0.0.0 --port {port}` |
-| `node.container` | node | Docker: `node -e "require('net')..."` |
 
 Custom toolchains go in `~/.replsh/config.edn` under `:toolchains`.
+
+**Port-mode Docker REPL** (spawn a fresh container, expose a port to the host):
+
+```clojure
+;; ~/.replsh/config.edn
+{:toolchains
+ {"python.myimage" {:backend  :python
+                    :cmd      "python3 {bridge} --host 0.0.0.0 --port {port}"
+                    :runtime  :docker
+                    :image    "python:3.12-slim"
+                    :defaults {:port 9876}}}}
+```
+
+Then `replsh launch python.myimage --name sandbox`.
 
 Run `replsh toolchains` to list all available toolchains (built-in + custom) as JSON.
 

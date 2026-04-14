@@ -4,7 +4,7 @@
             [replsh.cli :as cli]
             [replsh.command :as cmd]))
 
-;; Access private functions for testing
+;; Access private/public functions for testing
 (def load-help-text @#'cli/load-help-text)
 
 (deftest help-resource-available-test
@@ -65,19 +65,76 @@
           (is (= "nrepl" (:backend bb)))
           (is (= "local" (:runtime bb)))
           (is (= 1667 (:port bb))))
-        ;; Check container toolchain
-        (let [pyc (first (filter #(= "python.container" (:name %)) toolchains))]
-          (is (some? pyc) "python.container should be in the list")
-          (is (= "docker" (:runtime pyc))))
-        ;; Check bash toolchains
+        ;; Check bash toolchain
         (let [b (first (filter #(= "bash" (:name %)) toolchains))]
           (is (some? b) "bash should be in the list")
           (is (= "bash" (:backend b)))
           (is (= "local" (:runtime b))))
-        (let [bc (first (filter #(= "bash.container" (:name %)) toolchains))]
-          (is (some? bc) "bash.container should be in the list")
-          (is (= "docker" (:runtime bc))))
         ;; Should be sorted by name
         (is (= (sort (map :name toolchains))
                (map :name toolchains))
             "toolchains should be sorted by name")))))
+
+(deftest parse-pipeline-test
+  (testing "empty args returns empty :via and nil toolchain"
+    (is (= {:via [] :toolchain-name nil}
+           (cli/parse-pipeline []))))
+
+  (testing "ssh + toolchain"
+    (is (= {:via [{:type :ssh :host "user@host"}]
+            :toolchain-name "python"}
+           (cli/parse-pipeline ["--runtime" "ssh" "--host" "user@host"
+                                 "--toolchain" "python"]))))
+
+  (testing "ssh → docker → toolchain"
+    (is (= {:via [{:type :ssh :host "user@host"}
+                  {:type :docker :container "my-container"}]
+            :toolchain-name "python"}
+           (cli/parse-pipeline ["--runtime" "ssh" "--host" "user@host"
+                                 "--runtime" "docker" "--container" "my-container"
+                                 "--toolchain" "python"]))))
+
+  (testing "docker → ssh (reversed order)"
+    (is (= {:via [{:type :docker :container "outer"}
+                  {:type :ssh :host "internal.host"}]
+            :toolchain-name "python"}
+           (cli/parse-pipeline ["--runtime" "docker" "--container" "outer"
+                                 "--runtime" "ssh" "--host" "internal.host"
+                                 "--toolchain" "python"]))))
+
+  (testing "ssh → docker → bash → toolchain"
+    (is (= {:via [{:type :ssh :host "user@host"}
+                  {:type :docker :container "my-container"}
+                  {:type :bash :setup ["source /etc/profile.d/rbenv.sh"]}]
+            :toolchain-name "python"}
+           (cli/parse-pipeline ["--runtime" "ssh" "--host" "user@host"
+                                 "--runtime" "docker" "--container" "my-container"
+                                 "--runtime" "bash" "--setup" "source /etc/profile.d/rbenv.sh"
+                                 "--toolchain" "python"]))))
+
+  (testing "bash --setup accumulates multiple values"
+    (is (= {:via [{:type :bash :setup ["cmd1" "cmd2"]}]
+            :toolchain-name "python"}
+           (cli/parse-pipeline ["--runtime" "bash"
+                                 "--setup" "cmd1" "--setup" "cmd2"
+                                 "--toolchain" "python"]))))
+
+  (testing "ssh with port and key"
+    (is (= {:via [{:type :ssh :host "user@host" :port 2222 :key "~/.ssh/work"}]
+            :toolchain-name "python"}
+           (cli/parse-pipeline ["--runtime" "ssh" "--host" "user@host"
+                                 "--port" "2222" "--key" "~/.ssh/work"
+                                 "--toolchain" "python"]))))
+
+  (testing "docker with image (spawn new container)"
+    (is (= {:via [{:type :ssh :host "bastion"}
+                  {:type :docker :image "python:3.12"}]
+            :toolchain-name "python"}
+           (cli/parse-pipeline ["--runtime" "ssh" "--host" "bastion"
+                                 "--runtime" "docker" "--image" "python:3.12"
+                                 "--toolchain" "python"]))))
+
+  (testing "no toolchain flag"
+    (is (= {:via [{:type :ssh :host "user@host"}]
+            :toolchain-name nil}
+           (cli/parse-pipeline ["--runtime" "ssh" "--host" "user@host"])))))

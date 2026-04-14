@@ -68,47 +68,72 @@
                         :prompt-re    prompt-re
                         :init         init})))))
 
+(defn parse-pipeline
+  "Parse args after `--` into {:via [...] :toolchain-name str-or-nil}.
+   Each --runtime <type> opens a new layer; subsequent flags configure it until
+   the next --runtime or --toolchain. --toolchain sets the terminal backend."
+  [args]
+  (loop [[flag val & rest :as remaining] args
+         current nil
+         layers  []]
+    (cond
+      (empty? remaining)
+      {:via (cond-> layers current (conj current)) :toolchain-name nil}
+
+      (= flag "--runtime")
+      (recur rest {:type (keyword val)} (cond-> layers current (conj current)))
+
+      (= flag "--toolchain")
+      {:via (cond-> layers current (conj current)) :toolchain-name val}
+
+      (= flag "--setup")
+      (recur rest (update current :setup (fnil conj []) val) layers)
+
+      :else  ; --host, --port, --container, --image, --user, --key, --platform
+      (let [k (keyword (subs flag 2))
+            v (if (= k :port) (Long/parseLong val) val)]
+        (recur rest (assoc current k v) layers)))))
+
 (defn- exec-mode?
-  "Detect exec mode: --container, --ssh-host, or --image without --cmd."
-  [opts resolved]
-  (or (:container opts)
-      (:ssh-host opts)
-      (when resolved (:ssh-host resolved))
-      (and (or (:image opts) (when resolved (:image resolved)))
-           (not (or (:cmd opts) (when resolved (:cmd resolved)))))))
+  "Detect exec mode: pipeline args present (after --) or config has :via."
+  [args resolved]
+  (or (seq args)
+      (and resolved (seq (:via resolved)))))
 
 (defn- launch-handler
   [backend-type {:keys [opts args]}]
-  (let [{:keys [name cmd cwd env image container ssh-host volume kernel token prompt-re init port timeout exec-port platform force]} opts
+  (let [{:keys [name cmd cwd env image volume kernel token prompt-re init port timeout exec-port platform force]} opts
+        ;; Parse pipeline from args after `--`
+        pipeline     (when (seq args) (parse-pipeline args))
         ;; Try config resolution first (without port) to detect runtime
         pre-resolved (resolve-config name (cond-> {}
                                             cmd       (assoc :cmd cmd)
                                             cwd       (assoc :cwd cwd)
                                             image     (assoc :image image)
-                                            container (assoc :container container)
-                                            ssh-host  (assoc :ssh-host ssh-host)
                                             env       (assoc :env (parse-env env))
                                             init      (assoc :init init)
                                             kernel    (assoc :kernel kernel)
                                             token     (assoc :token token)
                                             prompt-re (assoc :prompt-re prompt-re)))]
-    (if (exec-mode? opts pre-resolved)
-      ;; Exec mode: inject REPL into existing/new container or via SSH
-      (let [bt (or backend-type
-                    (when pre-resolved (:backend-type pre-resolved))
-                    :python)]
+    (if (exec-mode? args pre-resolved)
+      ;; Exec mode: inject REPL via the ordered via chain
+      (let [;; Toolchain from pipeline > subcommand > config > default
+            bt (keyword (or (when pipeline (:toolchain-name pipeline))
+                            (when backend-type (clojure.core/name backend-type))
+                            (when pre-resolved (some-> (:backend-type pre-resolved) clojure.core/name))
+                            "python"))
+            ;; Via chain: from pipeline > from config
+            via (or (when (seq (:via pipeline)) (:via pipeline))
+                    (when pre-resolved (seq (:via pre-resolved)))
+                    [])]
         (when-not name
           (throw (ex-info "--name is required" {:code :missing-arg})))
-        (when-not (or container image ssh-host
-                      (when pre-resolved (:image pre-resolved))
-                      (when pre-resolved (:ssh-host pre-resolved)))
-          (throw (ex-info "--container, --image, or --ssh-host is required for exec mode"
+        (when (empty? via)
+          (throw (ex-info "A via chain is required for exec mode (use -- --runtime ... --toolchain ...)"
                           {:code :missing-arg})))
         (cmd/launch-exec-cmd! {:backend-type bt
                                :name         name
-                               :ssh-host     (or ssh-host (when pre-resolved (:ssh-host pre-resolved)))
-                               :container    container
-                               :image        (or image (when pre-resolved (:image pre-resolved)))
+                               :via          via
                                :env          (or (parse-env env) (when pre-resolved (:env pre-resolved)))
                                :volumes      (or (seq volume) (when pre-resolved (:volumes pre-resolved)))
                                :platform     (or platform (when pre-resolved (:platform pre-resolved)))
@@ -281,12 +306,10 @@
 
 (def ^:private launch-extra
   {:cmd       {:desc "Command to spawn the REPL server"}
-   :image     {:desc "Docker image for containerized REPL"}
-   :container {:alias :c :desc "Exec into existing Docker container"}
-   :ssh-host  {:desc "SSH host or ~/.ssh/config alias (user@host)" :coerce :string}
+   :image     {:desc "Docker image for containerized REPL (port mode)"}
    :volume    {:alias :v :desc "Volume mount (host:container[:mode])" :coerce []}
    :platform  {:desc "Docker platform (e.g., linux/amd64)"}
-   :exec-port {:desc "Bridge port inside container (exec mode)" :coerce :long :default 9876}
+   :exec-port {:desc "Bridge port inside the exec chain (exec mode)" :coerce :long :default 9876}
    :timeout   {:alias :t :desc "Port readiness timeout in ms" :coerce :long :default 30000}
    :force     {:alias :f :desc "Replace existing session with same name"
                :coerce :boolean}})

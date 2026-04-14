@@ -273,45 +273,53 @@
         (runtime/stop! runtime-info)
         (throw e)))))
 
+(defn- exec-via-container-id
+  "Extract container-id from a :via vector (innermost docker layer)."
+  [via]
+  (last (keep #(when (= :docker (:type %)) (:container %)) via)))
+
 (defn launch-exec-cmd!
-  "Launch exec-mode session: inject REPL bridge into existing/new container.
-   The bridge runs persistently inside the container; each eval opens an ephemeral proxy."
-  [{:keys [backend-type name ssh-host container image env volumes platform init timeout exec-port]}]
+  "Launch exec-mode session: inject REPL bridge via an ordered via chain.
+   The bridge runs persistently at the end of the chain; each eval opens an ephemeral proxy."
+  [{:keys [backend-type name via env volumes platform init timeout exec-port]}]
   (let [exec-port    (or exec-port 9876)
-        owned?       (boolean image)  ;; --image without --cmd → owned container
-        ;; Step 1: Verify or spawn container
-        container-id (if container
-                       ;; Existing container — verify it's running
-                       (do
-                         (when-not (runtime/alive? (cond-> {:runtime :exec :container-id container}
-                                                     ssh-host (assoc :ssh-host ssh-host)))
-                           (throw (ex-info (str "Container not running: " container)
-                                           {:code :container-not-running :container container})))
-                         container)
-                       ;; New container — spawn with image's default entrypoint
-                       (when image
-                         (let [runtime-info (runtime/spawn!
-                                              (cond-> {:runtime :exec :name name :image image}
-                                                ssh-host       (assoc :ssh-host ssh-host)
-                                                (seq volumes)  (assoc :volumes volumes)
-                                                (seq env)      (assoc :env-vars env)
-                                                platform       (assoc :platform platform)))]
-                           ;; Wait for the container to be running
-                           (Thread/sleep 1000)
-                           (when-not (runtime/alive? runtime-info)
-                             (runtime/stop! runtime-info)
-                             (throw (ex-info "Container exited immediately"
-                                             {:code :launch-failed :image image})))
-                           (:container-id runtime-info))))
-        runtime-info (cond-> {:runtime :exec :name name}
-                       ssh-host     (assoc :ssh-host ssh-host)
-                       container-id (assoc :container-id container-id))]
+        exec-via     (remove #(= :bash (:type %)) (or via []))
+        docker-layer (some #(when (= :docker (:type %)) %) exec-via)
+        owned?       (boolean (and docker-layer (:image docker-layer)))
+
+        ;; Step 1: Verify existing container or spawn a new one, updating :via accordingly
+        via (cond
+              owned?
+              ;; Spawn new container — spawn! returns updated :via with container-id
+              (let [spawn-result (runtime/spawn! {:runtime  :exec
+                                                  :name     name
+                                                  :via      via
+                                                  :env-vars env
+                                                  :volumes  volumes
+                                                  :platform platform})]
+                (Thread/sleep 1000)
+                (when-not (runtime/alive? {:runtime :exec :name name :via (:via spawn-result)})
+                  (runtime/stop! {:runtime :exec :name name :via (:via spawn-result)})
+                  (throw (ex-info "Container exited immediately"
+                                  {:code :launch-failed :image (:image docker-layer)})))
+                (:via spawn-result))
+
+              docker-layer
+              ;; Existing container — verify it's running
+              (do
+                (when-not (runtime/alive? {:runtime :exec :name name :via via})
+                  (throw (ex-info (str "Container not running: " (:container docker-layer))
+                                  {:code :container-not-running :container (:container docker-layer)})))
+                via)
+
+              :else via)
+
+        runtime-info {:runtime :exec :name name :via via}]
     (try
-      ;; Step 2: Deploy bridge into container
+      ;; Step 2: Deploy bridge into the end of the via chain
       (let [bridge-path (runtime/deploy-bridge! runtime-info)
 
-            ;; Step 3: Start persistent bridge server inside the container
-            ;; This is a host-side Process wrapping `docker exec` — NOT detached.
+            ;; Step 3: Start persistent bridge server — host Process wrapping the exec chain.
             ;; Killing the host Process kills the bridge.
             bridge-cmd  (str "python3 " bridge-path " --port " exec-port)
             bridge-proc (runtime/exec! runtime-info bridge-cmd {})]
@@ -331,7 +339,7 @@
               (loop []
                 (when (> (System/currentTimeMillis) deadline)
                   (throw (ex-info "Bridge did not respond to ping"
-                                  {:code :launch-failed :container container-id})))
+                                  {:code :launch-failed :via via})))
                 (if (.ready ^java.io.BufferedReader (:in proxy-handles))
                   (let [line (.readLine ^java.io.BufferedReader (:in proxy-handles))]
                     (when-not (and line (.contains ^String line "pong"))
@@ -342,7 +350,8 @@
               (.destroy ^Process (:process proxy-handles)))))
 
         ;; Step 5: Build and persist session
-        (let [bridge-pid (.pid ^Process (:process bridge-proc))
+        (let [bridge-pid    (.pid ^Process (:process bridge-proc))
+              container-id  (exec-via-container-id via)
               session-config {:name         name
                               :backend      backend-type
                               :runtime      :exec
@@ -350,12 +359,11 @@
                               :transport    {:type :exec :exec-port exec-port}
                               :env          {:cwd  (System/getProperty "user.dir")
                                              :vars (or env {})}
-                              :launch       (cond-> {:container-id container-id
-                                                     :bridge-pid   bridge-pid
-                                                     :bridge-path  bridge-path
-                                                     :exec-cmd     bridge-cmd
-                                                     :owned        owned?}
-                                              ssh-host (assoc :ssh-host ssh-host))
+                              :launch       {:via         via
+                                             :bridge-pid  bridge-pid
+                                             :bridge-path bridge-path
+                                             :exec-cmd    bridge-cmd
+                                             :owned       owned?}
                               :backend-opts {}
                               :internal     {}}
               session-config (cond-> session-config
@@ -375,13 +383,12 @@
                 (throw e))))
           (backend/close! live-state)
           (state/put-session! state session-config)
-          (output/success :launch {:name         name
-                                   :backend      (clojure.core/name backend-type)
-                                   :runtime      "exec"
-                                   :mode         "exec"
-                                   :container-id container-id
-                                   :owned        owned?
-                                   :env          (:env session-config)})))
+          (output/success :launch (cond-> {:name    name
+                                           :backend (clojure.core/name backend-type)
+                                           :runtime "exec"
+                                           :owned   owned?
+                                           :env     (:env session-config)}
+                                    container-id (assoc :container-id container-id)))))
       (catch Exception e
         ;; Clean up on failure
         (when owned? (runtime/stop! runtime-info))
@@ -486,15 +493,20 @@
   []
   (let [state (state/load-state)]
     (output/success :ls {:sessions (mapv (fn [[_ s]]
-                                          (let [s (runtime/normalize-session s)]
+                                          (let [s   (runtime/normalize-session s)
+                                                cid (exec-via-container-id (get-in s [:launch :via]))]
                                             (cond-> {:name    (:name s)
                                                      :backend (clojure.core/name (:backend s))
                                                      :runtime (clojure.core/name (:runtime s))
                                                      :env     (:env s)}
                                               (get-in s [:launch :pid])
                                               (assoc :pid (get-in s [:launch :pid]))
+                                              ;; Legacy docker sessions still have :container-id directly
                                               (get-in s [:launch :container-id])
-                                              (assoc :container-id (get-in s [:launch :container-id])))))
+                                              (assoc :container-id (get-in s [:launch :container-id]))
+                                              ;; Exec sessions store container-id in :via
+                                              cid
+                                              (assoc :container-id cid))))
                                         (:sessions state))
                          :active   (:active state)})))
 
@@ -546,9 +558,9 @@
       ;; Exec-mode session: kill bridge → re-deploy → re-start
       (= :exec (get-in session [:transport :type]))
       (let [bridge-pid   (get-in session [:launch :bridge-pid])
-            container-id (get-in session [:launch :container-id])
             exec-port    (get-in session [:transport :exec-port])
-            runtime-info (-> (runtime/session->runtime-info session) (assoc :name name))]
+            runtime-info (-> (runtime/session->runtime-info session) (assoc :name name))
+            container-id (exec-via-container-id (:via runtime-info))]
         ;; Kill existing bridge
         (when bridge-pid
           (try (process/kill! bridge-pid) (catch Exception _)))
@@ -687,7 +699,8 @@
     (when-not session
       (throw (ex-info (str "Session not found: " (or name "(no active session)"))
                       {:code :session-not-found})))
-    (let [session  (runtime/normalize-session session)
+    (let [session    (runtime/normalize-session session)
+          rt-info    (runtime/session->runtime-info session)
           reachable? (try
                        (let [ls (backend/open! session)]
                          (backend/close! ls)
@@ -701,18 +714,20 @@
                                        :reachable reachable?}
                                (and (:launch session) (= :exec (get-in session [:transport :type])))
                                (assoc :launch
-                                      (cond-> {:mode  "exec"
-                                               :alive (runtime/alive? (runtime/session->runtime-info session))
-                                               :owned (boolean (get-in session [:launch :owned]))}
-                                        (get-in session [:launch :bridge-pid])
-                                        (assoc :bridge-pid (get-in session [:launch :bridge-pid])
-                                               :bridge-alive (process/alive? (get-in session [:launch :bridge-pid])))
-                                        (get-in session [:launch :container-id])
-                                        (assoc :container-id (get-in session [:launch :container-id]))))
+                                      (let [via          (:via rt-info)
+                                            container-id (exec-via-container-id via)
+                                            bridge-pid   (get-in session [:launch :bridge-pid])]
+                                        (cond-> {:mode  "exec"
+                                                 :alive (runtime/alive? rt-info)
+                                                 :owned (boolean (get-in session [:launch :owned]))
+                                                 :via   via}
+                                          bridge-pid   (assoc :bridge-pid   bridge-pid
+                                                              :bridge-alive (process/alive? bridge-pid))
+                                          container-id (assoc :container-id container-id))))
                                (and (:launch session) (not= :exec (get-in session [:transport :type])))
                                (assoc :launch
                                       (cond-> {:cmd   (get-in session [:launch :cmd])
-                                               :alive (runtime/alive? (runtime/session->runtime-info session))}
+                                               :alive (runtime/alive? rt-info)}
                                         (get-in session [:launch :pid])
                                         (assoc :pid (get-in session [:launch :pid]))
                                         (get-in session [:launch :container-id])
