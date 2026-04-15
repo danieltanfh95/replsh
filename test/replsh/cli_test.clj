@@ -22,20 +22,25 @@
 
 (deftest help-dispatch-test
   (testing "--help returns nil (prints help, no envelope)"
-    (is (nil? (binding [*out* (java.io.StringWriter.)]
-                (cli/dispatch ["--help"])))))
+    (let [sw (java.io.StringWriter.)]
+      (is (nil? (binding [*out* sw] (cli/dispatch ["--help"]))))
+      (is (pos? (count (.toString sw))) "should have printed help text")
+      (is (.contains (.toString sw) "replsh") "help text should mention replsh")))
 
   (testing "-h returns nil"
-    (is (nil? (binding [*out* (java.io.StringWriter.)]
-                (cli/dispatch ["-h"])))))
+    (let [sw (java.io.StringWriter.)]
+      (is (nil? (binding [*out* sw] (cli/dispatch ["-h"]))))
+      (is (pos? (count (.toString sw))) "should have printed help text")))
 
   (testing "help returns nil"
-    (is (nil? (binding [*out* (java.io.StringWriter.)]
-                (cli/dispatch ["help"])))))
+    (let [sw (java.io.StringWriter.)]
+      (is (nil? (binding [*out* sw] (cli/dispatch ["help"]))))
+      (is (pos? (count (.toString sw))) "should have printed help text")))
 
   (testing "no args returns nil (shows help)"
-    (is (nil? (binding [*out* (java.io.StringWriter.)]
-                (cli/dispatch []))))))
+    (let [sw (java.io.StringWriter.)]
+      (is (nil? (binding [*out* sw] (cli/dispatch []))))
+      (is (pos? (count (.toString sw))) "should have printed help text"))))
 
 (deftest install-skill-dispatch-test
   (testing "--install-skill writes SKILL.md with frontmatter"

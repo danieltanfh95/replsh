@@ -81,4 +81,9 @@
     (let [code (watch/introspection-code :python)]
       (is (not (re-find #"(?m)^cwd\s*=" code)))
       (is (not (re-find #"(?m)^result\s*=" code)))
-      (is (str/includes? code "(lambda")))))
+      (is (str/includes? code "(lambda"))))
+
+  (testing "Node code references require.cache and JSON.stringify"
+    (let [code (watch/introspection-code :node)]
+      (is (str/includes? code "require.cache"))
+      (is (str/includes? code "JSON.stringify")))))

@@ -40,7 +40,7 @@
     (is (= "/app" (container-cwd ["/host/path:/app"]))))
 
   (testing "extracts from volume with mode"
-    (is (= "/workspace" (container-cwd ["/host:/workspace:ro"]))))
+    (is (= "/data" (container-cwd ["/host:/data:ro"]))))
 
   (testing "defaults to /workspace when no volumes"
     (is (= "/workspace" (container-cwd nil)))

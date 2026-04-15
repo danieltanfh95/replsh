@@ -1,5 +1,6 @@
 (ns replsh.output-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [cheshire.core :as json]
+            [clojure.test :refer [deftest is testing]]
             [replsh.output :as output]))
 
 (deftest success-test
@@ -39,3 +40,24 @@
   (testing "exit code for other errors"
     (is (= 2 (binding [*out* (java.io.StringWriter.)]
                (output/emit! (output/failure :eval {:code "unknown" :message "x"})))))))
+
+(deftest emit-chunk-test
+  (testing "emits JSON with :status streaming and whitelisted keys only"
+    (let [sw (java.io.StringWriter.)]
+      (binding [*out* sw]
+        (output/emit-chunk! {:type :out :content "hello" :stream :stdout
+                              :meta {} :extra-field "dropped"}))
+      (let [parsed (json/parse-string (.toString sw) true)]
+        (is (= "streaming" (:status parsed)))
+        (is (= "out" (:type parsed)))
+        (is (= "hello" (:content parsed)))
+        (is (nil? (:extra-field parsed)) "extra keys must be stripped")))))
+
+(deftest emit-summary-exit-codes-test
+  (testing "returns same exit codes as emit!"
+    (doseq [[result expected] [[(output/success :eval {}) 0]
+                                [(output/failure :eval {:code "eval_error" :message "x"}) 1]
+                                [(output/failure :eval {:code "timeout" :message "x"}) 3]
+                                [(output/failure :eval {:code "other" :message "x"}) 2]]]
+      (is (= expected (binding [*out* (java.io.StringWriter.)]
+                        (output/emit-summary! result)))))))

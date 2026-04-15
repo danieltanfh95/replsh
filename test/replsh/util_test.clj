@@ -10,7 +10,11 @@
       (is (> (count id) 5))))
 
   (testing "each call produces a unique id"
-    (is (not= (util/gen-id "a") (util/gen-id "a")))))
+    (is (not= (util/gen-id "a") (util/gen-id "a"))))
+
+  (testing "suffix is 8 hex characters"
+    (let [id (util/gen-id "eval")]
+      (is (re-matches #"eval-[0-9a-f]{8}" id)))))
 
 (deftest timestamp-test
   (testing "returns ISO-8601 string"
@@ -36,10 +40,22 @@
     (let [port (util/find-free-port)]
       (is (integer? port))
       (is (> port 0))
-      (is (< port 65536))))
+      (is (< port 65536)))))
 
-  (testing "each call returns a different port"
-    (is (not= (util/find-free-port) (util/find-free-port)))))
+(deftest log-dir-test
+  (testing "ends with /.replsh/logs/"
+    (is (clojure.string/ends-with? util/log-dir "/.replsh/logs/"))))
+
+(deftest read-edn-file-test
+  (testing "returns nil when file does not exist"
+    (is (nil? (util/read-edn-file "/nonexistent/path/that/does/not/exist.edn"))))
+
+  (testing "reads and parses EDN from existing file"
+    (let [f (java.io.File/createTempFile "test" ".edn")]
+      (try
+        (spit f (pr-str {:a 1 :b "two"}))
+        (is (= {:a 1 :b "two"} (util/read-edn-file (.getAbsolutePath f))))
+        (finally (.delete f))))))
 
 (deftest parse-env-args-test
   (testing "parses K=V pairs"

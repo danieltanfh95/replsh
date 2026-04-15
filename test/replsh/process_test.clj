@@ -54,6 +54,24 @@
     ;; Use a PID that definitely doesn't exist
     (is (= :already-dead (process/kill! 999999999)))))
 
+(deftest read-log-tail-test
+  (testing "returns last N lines"
+    (let [f (java.io.File/createTempFile "log" ".log")]
+      (try
+        (spit f "line1\nline2\nline3\nline4\nline5")
+        (is (= "line4\nline5" (process/read-log-tail (.getAbsolutePath f) 2)))
+        (finally (.delete f)))))
+
+  (testing "returns all lines when N exceeds line count"
+    (let [f (java.io.File/createTempFile "log" ".log")]
+      (try
+        (spit f "only-line")
+        (is (= "only-line" (process/read-log-tail (.getAbsolutePath f) 100)))
+        (finally (.delete f)))))
+
+  (testing "returns empty string for nonexistent file"
+    (is (= "" (process/read-log-tail "/nonexistent/file.log" 10)))))
+
 (deftest alive-test
   (testing "alive process returns true"
     (let [{:keys [pid]} (process/spawn! {:cmd "sleep 10"
