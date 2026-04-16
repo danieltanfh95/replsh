@@ -5,6 +5,7 @@
 .clj-kondo/
 .lsp/
 .claude/
+.succession/
 
 # Clojure build artifacts
 .nrepl-port
