@@ -6,13 +6,17 @@ This project uses replsh (its own tool) for development. You have a live REPL av
 
 ## Setup
 
-Install globally via [bbin](https://github.com/babashka/bbin) (one-time):
+Install globally via [bbin](https://github.com/babashka/bbin):
 
 ```bash
+# Dev install (always picks up latest source changes)
 bbin install .   # from the replsh project dir
+
+# Stable install (self-contained uberjar, no source-tree dependency)
+bb build && bbin install target/replsh.jar --as replsh
 ```
 
-This makes `replsh` available from any directory. Without bbin, `bb -m replsh.main` only works from the replsh project root.
+The dev install couples every invocation to the live source tree via `local/root`. The stable install produces a self-contained jar that works from any directory without depending on the source tree state.
 
 The project has `.replsh/config.edn` with a `dev` session. Launch it:
 

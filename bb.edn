@@ -4,4 +4,7 @@
  :main replsh.main
  :license {:name "EPL-2.0"
            :url "https://www.eclipse.org/legal/epl-2.0/"}
- :bbin/bin {replsh {:main-opts ["-m" "replsh.main"]}}}
+ :bbin/bin {replsh {:main-opts ["-m" "replsh.main"]}}
+ :tasks {build {:doc "Build self-contained uberjar"
+                :task (do (babashka.fs/create-dirs "target")
+                          (babashka.process/shell "bb" "uberjar" "target/replsh.jar" "-m" "replsh.main"))}}}
