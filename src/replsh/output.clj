@@ -14,16 +14,18 @@
            :error (select-keys error-map [:code :message :detail])}
     (:data error-map) (assoc :data (:data error-map))))
 
-(defn emit!
-  "Print result as JSON to stdout. Returns exit code."
-  [result]
-  (println (json/generate-string result))
-  (if (:ok result)
-    0
+(defn- result->exit-code [result]
+  (if (:ok result) 0
     (case (get-in result [:error :code])
       "eval_error" 1
       "timeout"    3
       2)))
+
+(defn emit!
+  "Print result as JSON to stdout. Returns exit code."
+  [result]
+  (println (json/generate-string result))
+  (result->exit-code result))
 
 (defn emit-chunk!
   "Print a single chunk as a JSON line to stdout (NDJSON). Flushes immediately."
@@ -38,9 +40,4 @@
   [result]
   (println (json/generate-string result))
   (flush)
-  (if (:ok result)
-    0
-    (case (get-in result [:error :code])
-      "eval_error" 1
-      "timeout"    3
-      2)))
+  (result->exit-code result))

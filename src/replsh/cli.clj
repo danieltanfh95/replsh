@@ -203,17 +203,20 @@
                              :timeout      timeout
                              :force        force})))))))
 
+(defn- read-code [opts args]
+  (let [file (:file opts)]
+    (cond
+      file         (slurp file)
+      (first args) (first args)
+      :else        (let [input (slurp *in*)]
+                     (when (empty? input)
+                       (throw (ex-info "No code provided (pass as argument, --file, or pipe to stdin)"
+                                       {:code :missing-arg})))
+                     input))))
+
 (defn- eval-handler
   [{:keys [opts args]}]
-  (let [file (:file opts)
-        code (cond
-               file          (slurp file)
-               (first args)  (first args)
-               :else         (let [input (slurp *in*)]
-                               (when (empty? input)
-                                 (throw (ex-info "No code provided (pass as argument, --file, or pipe to stdin)"
-                                                 {:code :missing-arg})))
-                               input))]
+  (let [code (read-code opts args)]
     (cond
       (:bg opts)
       (cmd/eval-bg-cmd {:name         (:name opts)
@@ -283,15 +286,7 @@
 
 (defn- replay-handler
   [{:keys [opts args]}]
-  (let [file (:file opts)
-        code (cond
-               file          (slurp file)
-               (first args)  (first args)
-               :else         (let [input (slurp *in*)]
-                               (when (empty? input)
-                                 (throw (ex-info "No code provided (pass as argument, --file, or pipe to stdin)"
-                                                 {:code :missing-arg})))
-                               input))]
+  (let [code (read-code opts args)]
     (cmd/replay-cmd {:name         (:name opts)
                      :code         code
                      :timeout      (:timeout opts)

@@ -25,6 +25,11 @@
 ;; launch-cmd's --force branch needs to call it.
 (declare stop-cmd)
 
+(defn- require-session! [session name]
+  (when-not session
+    (throw (ex-info (str "Session not found: " (or name "(no active session)"))
+                    {:code :session-not-found}))))
+
 (defn- port-open?
   "Return true if `host:port` accepts TCP connections right now."
   [host port]
@@ -278,6 +283,31 @@
   [via]
   (last (keep #(when (= :docker (:type %)) (:container %)) via)))
 
+(defn- verify-bridge-ping!
+  "Spawn an ephemeral proxy, send a ping, await pong, then destroy the proxy.
+   Throws with fail-code on timeout or bad response."
+  [runtime-info bridge-path exec-port timeout-ms fail-code]
+  (let [proxy-handles (runtime/exec! runtime-info
+                                     (str "python3 " bridge-path " --connect 127.0.0.1:" exec-port)
+                                     {})]
+    (try
+      (.println ^java.io.PrintWriter (:out proxy-handles)
+                (json/generate-string {:op "ping" :msg_id "ping"}))
+      (.flush ^java.io.PrintWriter (:out proxy-handles))
+      (let [deadline (+ (System/currentTimeMillis) (or timeout-ms 10000))]
+        (loop []
+          (when (> (System/currentTimeMillis) deadline)
+            (throw (ex-info "Bridge did not respond to ping"
+                            {:code fail-code})))
+          (if (.ready ^java.io.BufferedReader (:in proxy-handles))
+            (let [line (.readLine ^java.io.BufferedReader (:in proxy-handles))]
+              (when-not (and line (.contains ^String line "pong"))
+                (throw (ex-info "Bridge ping failed"
+                                {:code fail-code :response line}))))
+            (do (Thread/sleep 100) (recur)))))
+      (finally
+        (.destroy ^Process (:process proxy-handles))))))
+
 (defn launch-exec-cmd!
   "Launch exec-mode session: inject REPL bridge via an ordered via chain.
    The bridge runs persistently at the end of the chain; each eval opens an ephemeral proxy."
@@ -328,26 +358,7 @@
         (Thread/sleep 1000)
 
         ;; Step 4: Verify readiness via temporary proxy + ping
-        (let [proxy-handles (runtime/exec! runtime-info
-                                           (str "python3 " bridge-path " --connect 127.0.0.1:" exec-port)
-                                           {})]
-          (try
-            (let [out (:out proxy-handles)]
-              (.println ^java.io.PrintWriter out (cheshire.core/generate-string {:op "ping" :msg_id "launch-ping"}))
-              (.flush ^java.io.PrintWriter out))
-            (let [deadline (+ (System/currentTimeMillis) (or timeout 10000))]
-              (loop []
-                (when (> (System/currentTimeMillis) deadline)
-                  (throw (ex-info "Bridge did not respond to ping"
-                                  {:code :launch-failed :via via})))
-                (if (.ready ^java.io.BufferedReader (:in proxy-handles))
-                  (let [line (.readLine ^java.io.BufferedReader (:in proxy-handles))]
-                    (when-not (and line (.contains ^String line "pong"))
-                      (throw (ex-info "Bridge ping failed"
-                                      {:code :launch-failed :response line}))))
-                  (do (Thread/sleep 100) (recur)))))
-            (finally
-              (.destroy ^Process (:process proxy-handles)))))
+        (verify-bridge-ping! runtime-info bridge-path exec-port (or timeout 10000) :launch-failed)
 
         ;; Step 5: Build and persist session
         (let [bridge-pid    (.pid ^Process (:process bridge-proc))
@@ -399,9 +410,7 @@
   [{:keys [name code timeout hard-timeout stream? chunked?]}]
   (let [state      (state/load-state)
         session    (state/get-session state name)]
-    (when-not session
-      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
-                      {:code :session-not-found})))
+    (require-session! session name)
     (let [;; Compute effective backend timeout as min(soft, hard)
           ;; --timeout 0 means "no soft timeout" (wait forever unless hard timeout set)
           soft-ms    (let [t (or timeout 30000)] (if (zero? t) Long/MAX_VALUE t))
@@ -515,9 +524,7 @@
   [{:keys [name]}]
   (let [state   (state/load-state)
         session (state/get-session state name)]
-    (when-not session
-      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
-                      {:code :session-not-found})))
+    (require-session! session name)
     (if (= :exec (get-in session [:transport :type]))
       ;; Exec-mode session
       (let [bridge-pid (get-in session [:launch :bridge-pid])
@@ -551,9 +558,7 @@
   [{:keys [name timeout]}]
   (let [state   (state/load-state)
         session (state/get-session state name)]
-    (when-not session
-      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
-                      {:code :session-not-found})))
+    (require-session! session name)
     (cond
       ;; Exec-mode session: kill bridge → re-deploy → re-start
       (= :exec (get-in session [:transport :type]))
@@ -570,25 +575,7 @@
               bridge-proc  (runtime/exec! runtime-info bridge-cmd {})]
           (Thread/sleep 1000)
           ;; Verify with proxy ping
-          (let [proxy-handles (runtime/exec! runtime-info
-                                             (str "python3 " bridge-path " --connect 127.0.0.1:" exec-port)
-                                             {})]
-            (try
-              (.println ^java.io.PrintWriter (:out proxy-handles)
-                        (json/generate-string {:op "ping" :msg_id "restart-ping"}))
-              (.flush ^java.io.PrintWriter (:out proxy-handles))
-              (let [deadline (+ (System/currentTimeMillis) 10000)]
-                (loop []
-                  (when (> (System/currentTimeMillis) deadline)
-                    (throw (ex-info "Bridge did not respond to ping after restart"
-                                    {:code :restart-failed})))
-                  (if (.ready ^java.io.BufferedReader (:in proxy-handles))
-                    (let [line (.readLine ^java.io.BufferedReader (:in proxy-handles))]
-                      (when-not (and line (.contains ^String line "pong"))
-                        (throw (ex-info "Bridge ping failed" {:code :restart-failed :response line}))))
-                    (do (Thread/sleep 100) (recur)))))
-              (finally
-                (.destroy ^Process (:process proxy-handles)))))
+          (verify-bridge-ping! runtime-info bridge-path exec-port 10000 :restart-failed)
           ;; Update session with new bridge PID
           (let [new-bridge-pid (.pid ^Process (:process bridge-proc))
                 fresh-config   (-> session
@@ -696,9 +683,7 @@
   [{:keys [name]}]
   (let [state   (state/load-state)
         session (state/get-session state name)]
-    (when-not session
-      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
-                      {:code :session-not-found})))
+    (require-session! session name)
     (let [session    (runtime/normalize-session session)
           rt-info    (runtime/session->runtime-info session)
           reachable? (try
@@ -738,9 +723,7 @@
   [{:keys [name]}]
   (let [state   (state/load-state)
         session (state/get-session state name)]
-    (when-not session
-      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
-                      {:code :session-not-found})))
+    (require-session! session name)
     (let [session (runtime/normalize-session session)]
       (cond
         ;; Exec-mode: send SIGINT to the bridge wrapper Process (host PID)
@@ -1011,9 +994,7 @@
   [{:keys [name format]}]
   (let [state   (state/load-state)
         session (state/get-session state name)]
-    (when-not session
-      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
-                      {:code :session-not-found})))
+    (require-session! session name)
     (let [history (or (:history session) [])]
       (if (= format "script")
         ;; Script format: one form per line, separated by blank line
@@ -1040,9 +1021,7 @@
   [{:keys [name code timeout hard-timeout]}]
   (let [state   (state/load-state)
         session (state/get-session state name)]
-    (when-not session
-      (throw (ex-info (str "Session not found: " (or name "(no active session)"))
-                      {:code :session-not-found})))
+    (require-session! session name)
     (let [forms   (split-forms (:backend session) code)
           results (mapv (fn [form]
                           (eval-cmd {:name         name

@@ -54,73 +54,73 @@
   [ws-conn msg-id session-name timeout-ms on-chunk]
   (let [deadline (if (pos? timeout-ms)
                    (+ (System/currentTimeMillis) timeout-ms)
-                   Long/MAX_VALUE)
-        chunks   (atom [])]
-    (loop []
+                   Long/MAX_VALUE)]
+    (loop [chunks []]
       (let [remaining (- deadline (System/currentTimeMillis))]
         (when (<= remaining 0)
           (throw (ex-info "Timeout waiting for Jupyter response"
                           {:code :timeout :msg-id msg-id
-                           :chunks @chunks})))
+                           :chunks chunks})))
         (let [msg (ws/recv-json ws-conn (min remaining 1000))]
           (if-not msg
-            (recur)
+            (recur chunks)
             (let [parent-msg-id (get-in msg [:parent_header :msg_id])
-                  msg-type      (get-in msg [:header :msg_type])]
-              ;; Only process messages for our request
-              (when (= parent-msg-id msg-id)
-                (let [chunk (case msg-type
-                              "stream"
-                              (let [stream-name (get-in msg [:content :name])
-                                    text        (get-in msg [:content :text])]
-                                {:type    (if (= "stderr" stream-name) :err :out)
-                                 :content text
-                                 :stream  (keyword stream-name)
-                                 :meta    {}
-                                 :done?   false
-                                 :msg-id  msg-id
-                                 :name    session-name})
+                  msg-type      (get-in msg [:header :msg_type])
+                  ;; Accumulate chunk if this message belongs to our request
+                  chunks (if (= parent-msg-id msg-id)
+                           (let [chunk (case msg-type
+                                         "stream"
+                                         (let [stream-name (get-in msg [:content :name])
+                                               text        (get-in msg [:content :text])]
+                                           {:type    (if (= "stderr" stream-name) :err :out)
+                                            :content text
+                                            :stream  (keyword stream-name)
+                                            :meta    {}
+                                            :done?   false
+                                            :msg-id  msg-id
+                                            :name    session-name})
 
-                              "execute_result"
-                              (let [data (get-in msg [:content :data :text/plain])]
-                                {:type    :value
-                                 :content (or data "")
-                                 :meta    {:execution_count (get-in msg [:content :execution_count])}
-                                 :done?   false
-                                 :msg-id  msg-id
-                                 :name    session-name})
+                                         "execute_result"
+                                         (let [data (get-in msg [:content :data :text/plain])]
+                                           {:type    :value
+                                            :content (or data "")
+                                            :meta    {:execution_count (get-in msg [:content :execution_count])}
+                                            :done?   false
+                                            :msg-id  msg-id
+                                            :name    session-name})
 
-                              "error"
-                              (let [ename  (get-in msg [:content :ename])
-                                    evalue (get-in msg [:content :evalue])
-                                    tb     (get-in msg [:content :traceback])]
-                                {:type    :error
-                                 :content (str ename ": " evalue)
-                                 :meta    {:ename ename :evalue evalue
-                                           :traceback (vec tb)}
-                                 :done?   false
-                                 :msg-id  msg-id
-                                 :name    session-name})
+                                         "error"
+                                         (let [ename  (get-in msg [:content :ename])
+                                               evalue (get-in msg [:content :evalue])
+                                               tb     (get-in msg [:content :traceback])]
+                                           {:type    :error
+                                            :content (str ename ": " evalue)
+                                            :meta    {:ename ename :evalue evalue
+                                                      :traceback (vec tb)}
+                                            :done?   false
+                                            :msg-id  msg-id
+                                            :name    session-name})
 
-                              ;; Ignore other message types
-                              nil)]
-                  (when chunk
-                    (swap! chunks conj chunk)
-                    (when on-chunk (on-chunk chunk)))))
+                                         ;; Ignore other message types
+                                         nil)]
+                             (if chunk
+                               (do (when on-chunk (on-chunk chunk))
+                                   (conj chunks chunk))
+                               chunks))
+                           chunks)]
               ;; Check if we got execute_reply
               (if (and (= parent-msg-id msg-id)
                        (= msg-type "execute_reply"))
                 ;; Done — finalize chunks
-                (let [cs @chunks]
-                  (if (seq cs)
-                    (update cs (dec (count cs)) assoc :done? true)
-                    [{:type    :status
-                      :content ""
-                      :meta    {:status (get-in msg [:content :status])}
-                      :done?   true
-                      :msg-id  msg-id
-                      :name    session-name}]))
-                (recur)))))))))
+                (if (seq chunks)
+                  (update chunks (dec (count chunks)) assoc :done? true)
+                  [{:type    :status
+                    :content ""
+                    :meta    {:status (get-in msg [:content :status])}
+                    :done?   true
+                    :msg-id  msg-id
+                    :name    session-name}])
+                (recur chunks)))))))))
 
 ;; --- Multimethod implementations ---
 
