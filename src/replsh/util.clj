@@ -1,11 +1,24 @@
 (ns replsh.util
-  (:require [clojure.string :as str])
-  (:import [java.net ServerSocket]))
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str])
+  (:import [java.io File]
+           [java.net ServerSocket]))
+
+(def log-dir
+  "Path to the replsh logs directory."
+  (str (System/getProperty "user.home") "/.replsh/logs/"))
+
+(defn read-edn-file
+  "Read and parse an EDN file. Returns nil if file doesn't exist."
+  [^String path]
+  (let [f (File. path)]
+    (when (.exists f)
+      (edn/read-string (slurp f)))))
 
 (defn gen-id
   "Generate a short random ID with an optional prefix."
   [prefix]
-  (str prefix "-" (subs (str (java.util.UUID/randomUUID)) 0 8)))
+  (str prefix "-" (subs (str (random-uuid)) 0 8)))
 
 (defn timestamp
   "ISO-8601 timestamp string for now."

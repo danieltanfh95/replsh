@@ -1,17 +1,15 @@
 (ns replsh.process
   (:require [babashka.http-client :as http]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [replsh.util :as util])
   (:import [java.io File]
            [java.lang ProcessBuilder$Redirect]
            [java.net Socket]))
 
-(def ^:private log-dir
-  (str (System/getProperty "user.home") "/.replsh/logs/"))
-
 (defn- ensure-log-dir! []
-  (.mkdirs (File. log-dir)))
+  (.mkdirs (File. util/log-dir)))
 
-(defn- read-log-tail
+(defn read-log-tail
   "Read last N lines from a log file, or empty string if not readable."
   [log-path n]
   (try
@@ -24,7 +22,7 @@
    Throws :launch-failed if the process dies within 200ms."
   [{:keys [cmd cwd env-vars name]}]
   (ensure-log-dir!)
-  (let [log-file (File. (str log-dir name ".log"))
+  (let [log-file (File. (str util/log-dir name ".log"))
         pb       (ProcessBuilder. ^java.util.List ["/bin/sh" "-c" (str "exec " cmd)])]
     (.redirectErrorStream pb true)
     (.redirectOutput pb (ProcessBuilder$Redirect/appendTo log-file))

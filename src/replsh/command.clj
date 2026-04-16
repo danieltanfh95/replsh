@@ -937,9 +937,6 @@
 
 ;; --- Logs ---
 
-(def ^:private logs-dir
-  (str (System/getProperty "user.home") "/.replsh/logs/"))
-
 (defn logs-cmd
   "Read process logs for a session."
   [{:keys [name tail follow]}]
@@ -970,7 +967,7 @@
 
       ;; Follow mode: tail log file, emit lines as chunks
       follow
-      (let [log-file (str logs-dir sname ".log")]
+      (let [log-file (str util/log-dir sname ".log")]
         (when-not (.exists (File. log-file))
           (throw (ex-info (str "No log file for session: " sname)
                           {:code :log-not-found})))
@@ -995,13 +992,14 @@
 
       ;; Non-follow: dump lines from local log file
       :else
-      (let [log-file (str logs-dir sname ".log")]
+      (let [log-file (str util/log-dir sname ".log")]
         (when-not (.exists (File. log-file))
           (throw (ex-info (str "No log file for session: " sname)
                           {:code :log-not-found})))
-        (let [content (slurp log-file)
-              lines   (str/split-lines content)
-              lines   (if tail (vec (take-last tail lines)) (vec lines))]
+        (let [content (if tail
+                        (process/read-log-tail log-file tail)
+                        (slurp log-file))
+              lines   (str/split-lines content)]
           (output/success :logs {:name    sname
                                  :lines   (count lines)
                                  :content (str/join "\n" lines)}))))))

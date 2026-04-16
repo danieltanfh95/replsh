@@ -1,7 +1,7 @@
 (ns replsh.config
-  (:require [clojure.edn :as edn]
-            [clojure.string :as str]
-            [replsh.bridge :as bridge])
+  (:require [clojure.string :as str]
+            [replsh.bridge :as bridge]
+            [replsh.util :as util])
   (:import [java.io File]))
 
 ;; --- Built-in toolchain presets ---
@@ -49,13 +49,6 @@
 
 ;; --- Config file loading ---
 
-(defn- read-edn-file
-  "Read and parse an EDN file. Returns nil if file doesn't exist."
-  [^String path]
-  (let [f (File. path)]
-    (when (.exists f)
-      (edn/read-string (slurp f)))))
-
 (defn- walk-up
   "Walk from dir upward to filesystem root, returning lazy seq of paths."
   [^String dir]
@@ -70,7 +63,7 @@
   []
   (let [path (or (System/getenv "REPLSH_CONFIG_GLOBAL")
                  (str (System/getProperty "user.home") "/.replsh/config.edn"))]
-    (read-edn-file path)))
+    (util/read-edn-file path)))
 
 (defn load-project-config
   "Search for .replsh/config.edn walking up from cwd.
@@ -78,12 +71,12 @@
   []
   (let [override (System/getenv "REPLSH_CONFIG")]
     (if override
-      (when-let [config (read-edn-file override)]
+      (when-let [config (util/read-edn-file override)]
         {:config config :dir (.getParent (File. ^String override))})
       (let [cwd (System/getProperty "user.dir")]
         (some (fn [dir]
                 (let [path (str dir "/.replsh/config.edn")]
-                  (when-let [config (read-edn-file path)]
+                  (when-let [config (util/read-edn-file path)]
                     {:config config :dir dir})))
               (walk-up cwd))))))
 

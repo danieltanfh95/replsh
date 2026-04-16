@@ -1,6 +1,6 @@
 (ns replsh.state
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]))
+  (:require [clojure.java.io :as io]
+            [replsh.util :as util]))
 
 (defn state-path
   "Path to the global state file."
@@ -11,10 +11,7 @@
 (defn load-state
   "Load state from disk. Returns empty state if file doesn't exist."
   []
-  (let [f (io/file (state-path))]
-    (if (.exists f)
-      (edn/read-string (slurp f))
-      {:active nil :sessions {}})))
+  (or (util/read-edn-file (state-path)) {:active nil :sessions {}}))
 
 (defn save-state!
   "Persist state to disk. Creates parent dirs if needed."

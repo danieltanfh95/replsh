@@ -1,18 +1,11 @@
 (ns replsh.backend.python
   (:require [replsh.backend :as backend]
             [replsh.runtime :as runtime]
+            [replsh.transport.tcp :as tcp]
             [cheshire.core :as json])
   (:import [java.net Socket]
-           [java.io BufferedReader InputStreamReader OutputStreamWriter PrintWriter]
+           [java.io BufferedReader PrintWriter]
            [java.nio.charset StandardCharsets]))
-
-(defn- open-tcp
-  "Open a TCP socket for NDJSON I/O."
-  [host port]
-  (let [sock (Socket. ^String host ^int port)
-        in   (BufferedReader. (InputStreamReader. (.getInputStream sock) StandardCharsets/UTF_8))
-        out  (PrintWriter. (OutputStreamWriter. (.getOutputStream sock) StandardCharsets/UTF_8) true)]
-    {:socket sock :in in :out out}))
 
 (defn- send-json!
   "Send a JSON message as one NDJSON line."
@@ -112,7 +105,7 @@
   (let [transport-type (get-in session-config [:transport :type])
         handles (case transport-type
                   :tcp  (let [{:keys [host port]} (:transport session-config)]
-                          (open-tcp host port))
+                          (tcp/open-text-socket host port))
                   :exec (open-via-exec session-config))]
     (ping-pong! handles)
     {:config   session-config

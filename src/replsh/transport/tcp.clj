@@ -1,7 +1,17 @@
 (ns replsh.transport.tcp
   (:require [bencode.core :as bencode])
   (:import [java.net Socket]
-           [java.io PushbackInputStream BufferedOutputStream]))
+           [java.io BufferedOutputStream BufferedReader InputStreamReader OutputStreamWriter PrintWriter PushbackInputStream]
+           [java.nio.charset StandardCharsets]))
+
+(defn open-text-socket
+  "Open a TCP socket for text (NDJSON/raw) I/O with explicit UTF-8 encoding.
+   Returns {:socket s :in BufferedReader :out PrintWriter}."
+  [^String host ^int port]
+  (let [sock (Socket. host port)
+        in   (BufferedReader. (InputStreamReader. (.getInputStream sock) StandardCharsets/UTF_8))
+        out  (PrintWriter. (OutputStreamWriter. (.getOutputStream sock) StandardCharsets/UTF_8) true)]
+    {:socket sock :in in :out out}))
 
 (defn open-socket
   "Open a TCP socket. Returns {:socket s :in PushbackInputStream :out BufferedOutputStream}."

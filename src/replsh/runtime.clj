@@ -1,5 +1,6 @@
 (ns replsh.runtime
   (:require [replsh.process :as process]
+            [replsh.util :as util]
             [babashka.http-client :as http]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -105,14 +106,11 @@
   (process/alive? pid))
 
 (defmethod logs :local [{:keys [name]} {:keys [tail]}]
-  (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
-        log-file (File. (str log-dir name ".log"))]
+  (let [log-file (File. (str util/log-dir name ".log"))]
     (when (.exists log-file)
-      (let [content (slurp log-file)
-            lines   (str/split-lines content)]
-        (if tail
-          (str/join "\n" (take-last tail lines))
-          content)))))
+      (if tail
+        (process/read-log-tail (.getAbsolutePath log-file) tail)
+        (slurp log-file)))))
 
 (defmethod send-signal! :local [{:keys [pid]} signal]
   (-> (ProcessBuilder. ["kill" (str "-" signal) (str pid)])
@@ -137,9 +135,8 @@
 
 (defmethod exec! :local
   [{:keys [name]} cmd {:keys [stderr-log?]}]
-  (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
-        _        (.mkdirs (File. log-dir))
-        log-file (File. (str log-dir name ".exec.log"))
+  (let [_        (.mkdirs (File. util/log-dir))
+        log-file (File. (str util/log-dir name ".exec.log"))
         pb       (ProcessBuilder. ^java.util.List ["/bin/sh" "-c" cmd])]
     (.redirectErrorStream pb false)
     (.redirectError pb (ProcessBuilder$Redirect/appendTo log-file))
@@ -258,9 +255,8 @@
 
 (defmethod exec! :docker
   [{:keys [container-id name]} cmd {:keys [_stderr-log?]}]
-  (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
-        _        (.mkdirs (File. log-dir))
-        log-file (File. (str log-dir (or name "docker") ".exec.log"))
+  (let [_        (.mkdirs (File. util/log-dir))
+        log-file (File. (str util/log-dir (or name "docker") ".exec.log"))
         pb       (ProcessBuilder.
                    ^java.util.List ["docker" "exec" "-i" container-id "sh" "-c" cmd])]
     (.redirectErrorStream pb false)
@@ -334,9 +330,8 @@
 
 (defmethod exec! :exec
   [{:keys [name via]} cmd _opts]
-  (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
-        _        (.mkdirs (File. log-dir))
-        log-file (File. (str log-dir (or name "exec") ".exec.log"))
+  (let [_        (.mkdirs (File. util/log-dir))
+        log-file (File. (str util/log-dir (or name "exec") ".exec.log"))
         pb       (doto (ProcessBuilder. ^java.util.List (via-args (or via []) cmd))
                    (.redirectError (ProcessBuilder$Redirect/appendTo log-file)))
         process  (.start pb)]
@@ -430,11 +425,8 @@
 (defmethod deploy-files! :exec [_info _files] nil)
 
 (defmethod logs :exec [{:keys [name]} {:keys [tail]}]
-  (let [log-dir  (str (System/getProperty "user.home") "/.replsh/logs/")
-        log-file (File. (str log-dir (or name "exec") ".exec.log"))]
+  (let [log-file (File. (str util/log-dir (or name "exec") ".exec.log"))]
     (when (.exists log-file)
-      (let [content (slurp log-file)
-            lines   (str/split-lines content)]
-        (if tail
-          (str/join "\n" (take-last tail lines))
-          content)))))
+      (if tail
+        (process/read-log-tail (.getAbsolutePath log-file) tail)
+        (slurp log-file)))))

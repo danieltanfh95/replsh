@@ -1,16 +1,9 @@
 (ns replsh.backend.node
   (:require [replsh.backend :as backend]
+            [replsh.transport.tcp :as tcp]
             [clojure.string :as str])
   (:import [java.net Socket]
-           [java.io BufferedReader InputStreamReader PrintWriter]))
-
-(defn- open-tcp
-  "Open a TCP socket for raw text I/O."
-  [host port]
-  (let [sock (Socket. ^String host ^int port)
-        in   (BufferedReader. (InputStreamReader. (.getInputStream sock)))
-        out  (PrintWriter. (.getOutputStream sock) true)]
-    {:socket sock :in in :out out}))
+           [java.io BufferedReader PrintWriter]))
 
 (defn- read-until-prompt
   "Read from the socket until we see a trailing prompt (e.g. '> ').
@@ -99,7 +92,7 @@
   [session-config]
   (let [{:keys [host port]} (:transport session-config)
         prompt-str (get-in session-config [:backend-opts :prompt-re] "> ")
-        handles   (open-tcp host port)]
+        handles   (tcp/open-text-socket host port)]
     ;; Drain the initial prompt/banner
     (drain-prompt (:in handles) prompt-str)
     {:config  session-config
