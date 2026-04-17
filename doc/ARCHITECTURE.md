@@ -295,7 +295,9 @@ src/replsh/
     └── bash.clj         Bash protocol (delegates to python.clj runtime, bash subprocess)
 
 resources/
-└── replsh_bridge.py     Python bridge script (deployed into containers)
+└── replsh/
+    ├── HELP.md           CLI help + skill body (classpath-namespaced to avoid collisions)
+    └── replsh_bridge.py  Python bridge script (deployed into containers)
 
 test/replsh/
 ├── test_runner.clj      Test harness

@@ -383,8 +383,8 @@
            :follow {:alias :f :desc "Tail log until process exits" :coerce :boolean :default false}}}])
 
 (defn- load-help-text []
-  (or (some-> (io/resource "HELP.md") slurp)
-      "replsh — run 'replsh --help' for usage (HELP.md resource not found)"))
+  (or (some-> (io/resource "replsh/HELP.md") slurp)
+      "replsh — run 'replsh --help' for usage (replsh/HELP.md resource not found)"))
 
 (def ^:private skill-frontmatter
   "---\nname: replsh\ndescription: >\n  A thinking medium for LLM agents. Use the REPL to verify assumptions, inspect\n  runtime state, and test hypotheses — think before you write. Timeouts return\n  partial output (never lose work). Streaming and background eval handle any\n  timescale. Supports Clojure (deps.edn, Leiningen, Babashka), Python (native\n  bridge — zero deps, or Jupyter for rich output), and Node.js. Activate when\n  working on any project with a .replsh/config.edn, or any Clojure/Python/Node\n  project where a REPL would help you understand the code.\nlicense: EPL-2.0\ncompatibility: Requires Babashka (bb) installed. REPL servers started by replsh or running externally.\nmetadata:\n  author: Daniel Tan\n  repository: https://github.com/danieltanfh95/replsh\n---")

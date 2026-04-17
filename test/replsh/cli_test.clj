@@ -8,12 +8,12 @@
 (def load-help-text @#'cli/load-help-text)
 
 (deftest help-resource-available-test
-  (testing "HELP.md is on classpath (critical for bbin install)"
-    (is (some? (io/resource "HELP.md"))
-        "HELP.md must be on the classpath — without it, --help shows a fallback message after bbin install")))
+  (testing "replsh/HELP.md is on classpath (critical for bbin install)"
+    (is (some? (io/resource "replsh/HELP.md"))
+        "replsh/HELP.md must be on the classpath — without it, --help shows a fallback message after bbin install")))
 
 (deftest load-help-text-test
-  (testing "loads full help text from HELP.md resource"
+  (testing "loads full help text from replsh/HELP.md resource"
     (let [text (load-help-text)]
       (is (string? text))
       (is (> (count text) 100) "help text should be the full reference, not a stub")
