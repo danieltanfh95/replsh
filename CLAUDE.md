@@ -9,14 +9,14 @@ This project uses replsh (its own tool) for development. You have a live REPL av
 Install globally via [bbin](https://github.com/babashka/bbin):
 
 ```bash
-# Dev install (always picks up latest source changes)
-bbin install .   # from the replsh project dir
+# Recommended: stable install (self-contained uberjar)
+bb install       # from the replsh project dir
 
-# Stable install (self-contained uberjar, no source-tree dependency)
-bb build && bbin install target/replsh.jar --as replsh
+# Dev install (picks up source changes, but flaky from other directories)
+bbin install .
 ```
 
-The dev install couples every invocation to the live source tree via `local/root`. The stable install produces a self-contained jar that works from any directory without depending on the source tree state.
+The stable install builds a self-contained uberjar that works reliably from any directory. The dev install couples invocations to the source tree via `local/root`, which can fail intermittently when called from directories with their own `bb.edn`.
 
 The project has `.replsh/config.edn` with a `dev` session. Launch it:
 
