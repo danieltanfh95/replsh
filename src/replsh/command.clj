@@ -283,6 +283,16 @@
   [via]
   (last (keep #(when (= :docker (:type %)) (:container %)) via)))
 
+(defn- cleanup-bridge-zombies!
+  "Sweep any prior bridge processes bound to exec-port inside the runtime
+   target. Best-effort: errors are swallowed so launch/restart can proceed."
+  [runtime-info bridge-path exec-port]
+  (try
+    (let [cmd     (str "python3 " bridge-path " --cleanup-port " exec-port)
+          handles (runtime/exec! runtime-info cmd {})]
+      (.waitFor ^Process (:process handles)))
+    (catch Exception _)))
+
 (defn- verify-bridge-ping!
   "Spawn an ephemeral proxy, send a ping, await pong, then destroy the proxy.
    Throws with fail-code on timeout or bad response."
@@ -348,6 +358,8 @@
     (try
       ;; Step 2: Deploy bridge into the end of the via chain
       (let [bridge-path (runtime/deploy-bridge! runtime-info)
+            ;; Step 2b: Sweep any orphaned prior bridges still bound to exec-port
+            _           (cleanup-bridge-zombies! runtime-info bridge-path exec-port)
 
             ;; Step 3: Start persistent bridge server — host Process wrapping the exec chain.
             ;; Killing the host Process kills the bridge.
@@ -571,6 +583,8 @@
           (try (process/kill! bridge-pid) (catch Exception _)))
         ;; Re-deploy bridge (in case container was restarted)
         (let [bridge-path  (runtime/deploy-bridge! runtime-info)
+              ;; Sweep any orphaned prior bridges still bound to exec-port
+              _            (cleanup-bridge-zombies! runtime-info bridge-path exec-port)
               bridge-cmd   (str "python3 " bridge-path " --port " exec-port)
               bridge-proc  (runtime/exec! runtime-info bridge-cmd {})]
           (Thread/sleep 1000)
@@ -930,7 +944,8 @@
                   (throw (ex-info "No session name provided and no active session"
                                   {:code :missing-arg})))
         session (when session (runtime/normalize-session session))
-        is-docker? (and session (= :docker (:runtime session)))]
+        is-docker? (and session (= :docker (:runtime session)))
+        is-exec?   (and session (= :exec   (:runtime session)))]
     (cond
       ;; Docker session: use docker logs
       is-docker?
@@ -947,6 +962,18 @@
             (output/success :logs {:name    sname
                                    :lines   (count lines)
                                    :content (or content "")}))))
+
+      ;; Exec-mode session: bridge stderr lives in <name>.exec.log
+      is-exec?
+      (let [rt-info (runtime/session->runtime-info session)
+            content (runtime/logs rt-info {:tail tail})]
+        (when-not content
+          (throw (ex-info (str "No log file for session: " sname)
+                          {:code :log-not-found})))
+        (let [lines (str/split-lines content)]
+          (output/success :logs {:name    sname
+                                 :lines   (count lines)
+                                 :content content})))
 
       ;; Follow mode: tail log file, emit lines as chunks
       follow

@@ -7,12 +7,14 @@ Python interpreter (venv, poetry, conda) so all project packages are available.
 Protocol: NDJSON over TCP. Each message is one JSON object + newline.
 """
 import sys
+import glob
 import json
 import os
 import signal
 import socket
 import subprocess
 import threading
+import time
 import traceback
 
 
@@ -291,6 +293,44 @@ class BashBridge(ReplBridge):
                         'msg_id': msg_id, 'done': True})
 
 
+def cleanup_port(port):
+    """Terminate any prior bridge instances bound to <port>.
+
+    Walks /proc, finds python processes whose cmdline contains both
+    'replsh_bridge.py' and '--port <port>', SIGTERMs them, then SIGKILLs
+    survivors after a 1s grace. Runs inside the target container, so /proc
+    is the local Linux /proc (always available). No-op on /proc-less hosts.
+    """
+    me = os.getpid()
+    marker = '--port {}'.format(port)
+    victims = []
+    for path in glob.glob('/proc/[0-9]*/cmdline'):
+        try:
+            pid = int(path.split('/')[2])
+            if pid == me:
+                continue
+            with open(path, 'rb') as f:
+                cmdline = f.read().decode('utf-8', 'replace').replace('\x00', ' ')
+            if 'replsh_bridge.py' in cmdline and marker in cmdline:
+                victims.append(pid)
+        except (FileNotFoundError, ProcessLookupError, ValueError, PermissionError):
+            continue
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if victims:
+        time.sleep(1.0)
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    print('replsh cleanup-port {}: terminated {} prior bridge(s)'.format(
+        port, len(victims)), file=sys.__stderr__)
+
+
 def connect_proxy(host, port):
     """Connect to a running bridge via TCP, relay stdin<->TCP.
 
@@ -331,6 +371,8 @@ if __name__ == '__main__':
         addr = args[args.index('--connect') + 1]
         h, p = addr.rsplit(':', 1)
         connect_proxy(h, int(p))          # proxy is backend-agnostic
+    elif '--cleanup-port' in args:
+        cleanup_port(int(args[args.index('--cleanup-port') + 1]))
     else:
         host = 'localhost'
         port = 9876
