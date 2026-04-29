@@ -5,6 +5,7 @@
             [replsh.config-test]
             [replsh.cli-test]
             [replsh.runtime-test]
+            [replsh.state-test]
             [replsh.watch-test]
             [replsh.command-test]
             [replsh.process-test]
@@ -19,6 +20,7 @@
                             'replsh.config-test
                             'replsh.cli-test
                             'replsh.runtime-test
+                            'replsh.state-test
                             'replsh.watch-test
                             'replsh.command-test]
                    (not unit-only?) (into ['replsh.process-test

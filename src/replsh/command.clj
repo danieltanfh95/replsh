@@ -92,8 +92,7 @@
         ;; trust that over the user-supplied metadata.
         session-config (cond-> (assoc session-config :internal (:internal live-state))
                          (get-in live-state [:internal :actual-cwd])
-                         (assoc-in [:env :cwd] (get-in live-state [:internal :actual-cwd])))
-        state (state/load-state)]
+                         (assoc-in [:env :cwd] (get-in live-state [:internal :actual-cwd])))]
     ;; Run init code if provided — abort on failure
     (when init
       (try
@@ -103,7 +102,7 @@
           (try (backend/destroy! session-config) (catch Exception _))
           (throw e))))
     (backend/close! live-state)
-    (state/put-session! state session-config)
+    (state/update-session! name (constantly session-config))
     (output/success :start {:name    name
                             :backend (clojure.core/name backend-type)
                             :env     (:env session-config)})))
@@ -131,8 +130,8 @@
                                  (:transport existing))
                          {:code :session-exists :name name :existing existing}))
                 ;; Old entry is a corpse — clean up silently and proceed.
-                ;; remove-session! already saves state.
-                (state/remove-session! (state/load-state) name))
+                ;; remove-session! is atomic and persists.
+                (state/remove-session! name))
 
               ;; --force: stop the old one first, then proceed.
               :else
@@ -253,8 +252,7 @@
               ;; cwd (Fix 2), trust that over the spawn-time metadata.
               session-config (cond-> (assoc session-config :internal (:internal live-state))
                                (get-in live-state [:internal :actual-cwd])
-                               (assoc-in [:env :cwd] (get-in live-state [:internal :actual-cwd])))
-              state          (state/load-state)]
+                               (assoc-in [:env :cwd] (get-in live-state [:internal :actual-cwd])))]
           ;; 6. Run init code if provided
           (when init
             (try
@@ -264,7 +262,7 @@
                 (runtime/stop! runtime-info)
                 (throw e))))
           (backend/close! live-state)
-          (state/put-session! state session-config)
+          (state/update-session! name (constantly session-config))
           (output/success :launch (cond-> {:name    name
                                            :backend (clojure.core/name backend-type)
                                            :runtime (clojure.core/name runtime-type)
@@ -393,8 +391,7 @@
                                init (assoc :init-code init))
               ;; Verify full eval connectivity
               live-state     (backend/open! session-config)
-              session-config (assoc session-config :internal (:internal live-state))
-              state          (state/load-state)]
+              session-config (assoc session-config :internal (:internal live-state))]
           ;; Run init code if provided
           (when init
             (try
@@ -405,7 +402,7 @@
                 (when owned? (runtime/stop! runtime-info))
                 (throw e))))
           (backend/close! live-state)
-          (state/put-session! state session-config)
+          (state/update-session! name (constantly session-config))
           (output/success :launch (cond-> {:name    name
                                            :backend (clojure.core/name backend-type)
                                            :runtime "exec"
@@ -456,13 +453,21 @@
             history-entry {:code   code
                            :ts     (System/currentTimeMillis)
                            :status eval-status}
-            new-session   (-> (cond-> (assoc session :internal (:internal live-state))
-                                true                           (assoc :last-eval-at (System/currentTimeMillis))
-                                (:loaded-mtimes detect-result) (assoc :loaded-mtimes (:loaded-mtimes detect-result)))
-                              (update :history
-                                      (fn [h] (vec (take-last 100 (conj (or h []) history-entry))))))]
+            mtimes        (:loaded-mtimes detect-result)
+            new-internal  (:internal live-state)
+            now           (System/currentTimeMillis)]
         (backend/close! live-state)
-        (state/put-session! state new-session)
+        ;; Atomic merge against the freshest session record. If the session
+        ;; was concurrently removed, skip the persist (return nil).
+        (state/update-session! name
+          (fn [latest]
+            (when latest
+              (-> latest
+                  (assoc :internal new-internal)
+                  (assoc :last-eval-at now)
+                  (cond-> mtimes (assoc :loaded-mtimes mtimes))
+                  (update :history
+                          (fn [h] (vec (take-last 100 (conj (or h []) history-entry)))))))))
         (let [clean-chunks (mapv #(select-keys % [:type :content :stream :meta]) chunks)
               ;; Join stdout for top-level :output field
               stdout (->> clean-chunks
@@ -551,7 +556,7 @@
           (try
             (runtime/stop! (runtime/session->runtime-info session))
             (catch Exception _)))
-        (state/remove-session! state (:name session))
+        (state/remove-session! (:name session))
         (output/success :stop {:name (:name session)}))
       ;; Port-mode / non-exec session (existing behavior)
       (do
@@ -562,7 +567,7 @@
         (try
           (backend/destroy! session)
           (catch Exception _))
-        (state/remove-session! state (:name session))
+        (state/remove-session! (:name session))
         (output/success :stop {:name (:name session)})))))
 
 (defn restart-cmd
@@ -592,17 +597,24 @@
           (verify-bridge-ping! runtime-info bridge-path exec-port 10000 :restart-failed)
           ;; Update session with new bridge PID
           (let [new-bridge-pid (.pid ^Process (:process bridge-proc))
-                fresh-config   (-> session
+                open-config    (-> session
                                    (assoc :internal {})
                                    (assoc-in [:launch :bridge-pid] new-bridge-pid)
                                    (assoc-in [:launch :bridge-path] bridge-path)
                                    (assoc-in [:launch :exec-cmd] bridge-cmd))
-                live-state     (backend/open! fresh-config)
-                new-session    (assoc fresh-config :internal (:internal live-state))]
+                live-state     (backend/open! open-config)
+                new-internal   (:internal live-state)]
             (when-let [init-code (:init-code session)]
-              (run-init! new-session live-state init-code))
+              (run-init! (assoc open-config :internal new-internal) live-state init-code))
             (backend/close! live-state)
-            (state/put-session! state new-session)
+            (state/update-session! name
+              (fn [latest]
+                (when latest
+                  (-> latest
+                      (assoc :internal new-internal)
+                      (assoc-in [:launch :bridge-pid] new-bridge-pid)
+                      (assoc-in [:launch :bridge-path] bridge-path)
+                      (assoc-in [:launch :exec-cmd] bridge-cmd)))))
             (output/success :restart {:name         name
                                       :backend      (clojure.core/name (:backend session))
                                       :runtime      "exec"
@@ -645,27 +657,32 @@
                                      {:url (get-in session [:transport :url])
                                       :timeout-ms (or timeout 30000)
                                       :check :http}))
-              (let [;; Update transport with discovered port
-                    session (if (not= host-port (get-in session [:transport :port]))
-                              (assoc-in session [:transport :port] host-port)
-                              session)
-                    launch-info (cond-> {:cmd cmd :cwd cwd}
+              (let [launch-info (cond-> {:cmd cmd :cwd cwd}
                                   (:pid runtime-info)
                                   (assoc :pid (:pid runtime-info))
                                   (:container-id runtime-info)
                                   (assoc :container-id (:container-id runtime-info))
                                   (get-in session [:launch :image])
                                   (assoc :image (get-in session [:launch :image])))
-                    fresh-config (-> session
+                    open-config  (-> session
+                                     (cond-> (not= host-port (get-in session [:transport :port]))
+                                       (assoc-in [:transport :port] host-port))
                                      (assoc :internal {})
                                      (assoc :launch launch-info))
-                    live-state   (backend/open! fresh-config)
-                    new-session  (assoc fresh-config :internal (:internal live-state))]
+                    live-state   (backend/open! open-config)
+                    new-internal (:internal live-state)]
                 ;; Re-run init code if present
                 (when-let [init-code (:init-code session)]
-                  (run-init! new-session live-state init-code))
+                  (run-init! (assoc open-config :internal new-internal) live-state init-code))
                 (backend/close! live-state)
-                (state/put-session! state new-session)
+                (state/update-session! (:name session)
+                  (fn [latest]
+                    (when latest
+                      (-> latest
+                          (cond-> (not= host-port (get-in latest [:transport :port]))
+                            (assoc-in [:transport :port] host-port))
+                          (assoc :launch launch-info)
+                          (assoc :internal new-internal)))))
                 (output/success :restart (cond-> {:name    (:name session)
                                                   :backend (clojure.core/name (:backend session))
                                                   :runtime (clojure.core/name runtime-type)}
@@ -681,14 +698,17 @@
       :else
       (do
         (try (backend/destroy! session) (catch Exception _))
-        (let [fresh-config (assoc session :internal {})
-              live-state   (backend/open! fresh-config)
-              new-session  (assoc fresh-config :internal (:internal live-state))]
+        (let [open-config  (assoc session :internal {})
+              live-state   (backend/open! open-config)
+              new-internal (:internal live-state)]
           ;; Re-run init code if present
           (when-let [init-code (:init-code session)]
-            (run-init! new-session live-state init-code))
+            (run-init! (assoc open-config :internal new-internal) live-state init-code))
           (backend/close! live-state)
-          (state/put-session! state new-session)
+          (state/update-session! (:name session)
+            (fn [latest]
+              (when latest
+                (assoc latest :internal new-internal))))
           (output/success :restart {:name (:name session)
                                     :backend (clojure.core/name (:backend session))}))))))
 
